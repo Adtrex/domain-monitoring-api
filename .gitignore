@@ -1,0 +1,23 @@
+# Nuclei binaries and temp
+# bin/nuclei*
+# bin/nuclei.exe
+# nuclei-templates/
+# *.tmp
+# *.temp
+
+
+# Nuclei binaries and templates
+bin/
+nuclei-templates/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
