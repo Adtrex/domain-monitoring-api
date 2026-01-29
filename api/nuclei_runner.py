@@ -1,78 +1,67 @@
-import subprocess
-import json
 import os
 import platform
-from pathlib import Path
+import subprocess
+import json
+import urllib.request
+import zipfile
+import stat
 
-# ==========================
-# Nuclei path setup
-# ==========================
-BASE_DIR = Path(__file__).resolve().parent.parent
-NUCLEI_FOLDER = BASE_DIR / "bin"
+BIN_DIR = os.path.join(os.path.dirname(__file__), "../bin")
+os.makedirs(BIN_DIR, exist_ok=True)
 
-# Detect OS
-system = platform.system().lower()
-if system == "windows":
-    NUCLEI_PATH = NUCLEI_FOLDER / "nuclei.exe"
-else:
-    NUCLEI_PATH = NUCLEI_FOLDER / "nuclei"
+IS_WINDOWS = platform.system() == "Windows"
+NUCLEI_VERSION = "v3.7.0"
+NUCLEI_ZIP_NAME = f"nuclei_3.7.0_{'windows_amd64' if IS_WINDOWS else 'linux_amd64'}.zip"
+NUCLEI_PATH = os.path.join(BIN_DIR, "nuclei.exe" if IS_WINDOWS else "nuclei")
 
-# Allow override via environment variable
-NUCLEI_PATH = os.getenv("NUCLEI_PATH", str(NUCLEI_PATH))
+def download_nuclei():
+    if os.path.exists(NUCLEI_PATH):
+        return
 
-# Check binary exists
-if not os.path.exists(NUCLEI_PATH):
-    raise FileNotFoundError(f"Nuclei not found at: {NUCLEI_PATH}")
+    print(f"[INFO] Downloading Nuclei {NUCLEI_VERSION}...")
+    url = f"https://github.com/projectdiscovery/nuclei/releases/download/{NUCLEI_VERSION}/{NUCLEI_ZIP_NAME}"
+    zip_path = os.path.join(BIN_DIR, NUCLEI_ZIP_NAME)
 
-# ==========================
-# Nuclei scan runner
-# ==========================
-def run_nuclei_scan(target: str, templates: list = None):
-    """
-    Run nuclei scan on a target.
-    
-    Args:
-        target (str): domain or IP
-        templates (list, optional): list of template names (e.g., ["ssl", "cnvd"])
-    
-    Returns:
-        list: JSON results from Nuclei
-    """
+    urllib.request.urlretrieve(url, zip_path)
+
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(BIN_DIR)
+    os.remove(zip_path)
+
+    if not IS_WINDOWS:
+        st = os.stat(NUCLEI_PATH)
+        os.chmod(NUCLEI_PATH, st.st_mode | stat.S_IEXEC)
+    print("[INFO] Nuclei ready!")
+
+def run_nuclei_scan(target, templates=None):
+    download_nuclei()
     templates = templates or ["ssl"]
     results = []
 
-    for template in templates:
-        command = [
-            NUCLEI_PATH,
-            "-u", target,
-            "-t", template,
-            "-jsonl"  # output JSON lines
-        ]
+    if not os.path.exists(NUCLEI_PATH):
+        raise FileNotFoundError(f"Nuclei binary not found at {NUCLEI_PATH}")
 
+    for template in templates:
+        command = [NUCLEI_PATH, "-u", target, "-t", template, "-jsonl"]
         try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            # Each line is a separate JSON object
+            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+
             for line in proc.stdout.splitlines():
-                if line.strip():
-                    results.append(json.loads(line))
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        results.append(data)
+                    else:
+                        print(f"[WARN] Skipping non-dict JSON line: {line}")
+                except json.JSONDecodeError:
+                    print(f"[ERROR] Failed to parse JSON line: {line}")
+
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Scan failed for template {template}: {e}")
-            print(f"STDOUT: {e.stdout}")
-            print(f"STDERR: {e.stderr}")
+            print(f"[ERROR] Scan error for template '{template}': {e}")
         except Exception as e:
             print(f"[ERROR] Unexpected error: {e}")
 
     return results
-
-# ==========================
-# Example usage
-# ==========================
-if __name__ == "__main__":
-    target_domain = "example.com"
-    scan_results = run_nuclei_scan(target_domain, templates=["ssl"])
-    print(json.dumps(scan_results, indent=2))
