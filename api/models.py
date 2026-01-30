@@ -1,465 +1,395 @@
 from django.db import models
+from django.contrib.postgres.fields import ArrayField
+from django.utils import timezone
 
-class TestModel(models.Model):
-    title = models.CharField(max_length=200)
-    description = models.TextField()
+
+# ============================================
+# DOMAIN & ASSET MODELS
+# ============================================
+
+class Domain(models.Model):
+    """Core domain model for managing monitored domains"""
+    STATUS_CHOICES = [
+        ('Active', 'Active'),
+        ('Inactive', 'Inactive'),
+        ('Suspended', 'Suspended'),
+    ]
+    
+    root_domain = models.CharField(max_length=255, unique=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Active')
+    registrar = models.CharField(max_length=255, blank=True, null=True)
+    expiry_date = models.DateTimeField(blank=True, null=True)
+    owner = models.CharField(max_length=255, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    is_active = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'domains'
+        ordering = ['root_domain']
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['expiry_date']),
+        ]
     
     def __str__(self):
-        return self.title
+        return self.root_domain
 
 
-# models.py
-
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-from enum import Enum
-from pydantic import BaseModel, Field
-
-
-# ============ ENUMS ============
-
-class AssetType(str, Enum):
-    ROOT_DOMAIN = "root_domain"
-    SUBDOMAIN = "subdomain"
-    URL = "url"
-
-
-class ScanType(str, Enum):
-    ON_DEMAND = "on-demand"
-    SCHEDULED = "scheduled"
-    TRIGGERED = "triggered"
-
-
-class ScanStatus(str, Enum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class FindingStatus(str, Enum):
-    OPEN = "open"
-    IN_PROGRESS = "in_progress"
-    RESOLVED = "resolved"
-    FALSE_POSITIVE = "false_positive"
-
-
-class RiskRating(str, Enum):
-    LOW = "Low"
-    MEDIUM = "Medium"
-    HIGH = "High"
-    CRITICAL = "Critical"
-
-
-class FindingCategory(str, Enum):
-    CVE = "CVE"
-    SSL = "SSL"
-    DNS = "DNS"
-    EMAIL = "Email"
-    MISCONFIGURATION = "Misconfiguration"
-
-
-class DomainStatus(str, Enum):
-    ACTIVE = "Active"
-    INACTIVE = "Inactive"
-    SUSPENDED = "Suspended"
-
-
-class ConfidenceLevel(str, Enum):
-    HIGH = "High"
-    MEDIUM = "Medium"
-    LOW = "Low"
-
-
-# ============ CORE MODELS ============
-
-class DomainBase(BaseModel):
-    root_domain: str = Field(..., description="Root domain name")
-    status: DomainStatus = Field(default=DomainStatus.ACTIVE)
-    registrar: Optional[str] = None
-    expiry_date: Optional[datetime] = None
-    owner: Optional[str] = None
-
-
-class DomainCreate(DomainBase):
-    pass
-
-
-class Domain(DomainBase):
-    id: int
-    created_at: datetime
-    updated_at: datetime
+class Asset(models.Model):
+    """Assets discovered under domains (subdomains, URLs)"""
+    ASSET_TYPE_CHOICES = [
+        ('root_domain', 'Root Domain'),
+        ('subdomain', 'Subdomain'),
+        ('url', 'URL'),
+    ]
     
-    class Config:
-        from_attributes = True
-
-
-class AssetBase(BaseModel):
-    domain_id: int
-    asset_type: AssetType
-    value: str = Field(..., description="Asset URL or domain")
-    source: str = Field(..., description="Discovery method")
-    ip_address: Optional[str] = None
-
-
-class AssetCreate(AssetBase):
-    pass
-
-
-class Asset(AssetBase):
-    id: int
-    discovered_at: datetime
-    last_verified: Optional[datetime] = None
+    domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='assets')
+    asset_type = models.CharField(max_length=20, choices=ASSET_TYPE_CHOICES)
+    value = models.CharField(max_length=500)  # URL or domain value
+    source = models.CharField(max_length=100)  # Discovery method
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    discovered_at = models.DateTimeField(auto_now_add=True)
+    last_verified = models.DateTimeField(blank=True, null=True)
     
-    class Config:
-        from_attributes = True
-
-
-class ScanBase(BaseModel):
-    initiated_by: Optional[int] = None  # User ID placeholder
-    scan_type: ScanType
-    status: ScanStatus = Field(default=ScanStatus.QUEUED)
-    error_message: Optional[str] = None
-
-
-class ScanCreate(ScanBase):
-    pass
-
-
-class Scan(ScanBase):
-    id: int
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    duration_seconds: Optional[int] = None
-    created_at: datetime
+    class Meta:
+        db_table = 'assets'
+        ordering = ['-discovered_at']
+        indexes = [
+            models.Index(fields=['domain', 'asset_type']),
+            models.Index(fields=['value']),
+        ]
     
-    class Config:
-        from_attributes = True
+    def __str__(self):
+        return f"{self.asset_type}: {self.value}"
 
 
-class ScanAssetBase(BaseModel):
-    scan_id: int
-    asset_id: int
-    scan_started: Optional[datetime] = None
-    scan_completed: Optional[datetime] = None
+# ============================================
+# SCAN MODELS
+# ============================================
 
-
-class ScanAssetCreate(ScanAssetBase):
-    pass
-
-
-class ScanAsset(ScanAssetBase):
-    id: int
+class Scan(models.Model):
+    """Main scan execution records"""
+    SCAN_TYPE_CHOICES = [
+        ('on-demand', 'On-Demand'),
+        ('scheduled', 'Scheduled'),
+        ('triggered', 'Triggered'),
+    ]
     
-    class Config:
-        from_attributes = True
-
-
-class FindingBase(BaseModel):
-    asset_id: int
-    title: str
-    category: FindingCategory
-    nuclei_template_id: str
-    nuclei_severity: str
-    cvss_score: Optional[float] = None
-    cvss_vector: Optional[str] = None
-    risk_rating: RiskRating
-    scoring_confidence: ConfidenceLevel
-    evidence: str
-    recommendation: str
-    status: FindingStatus = Field(default=FindingStatus.OPEN)
-
-
-class FindingCreate(FindingBase):
-    pass
-
-
-class Finding(FindingBase):
-    id: int
-    first_seen: datetime
-    last_seen: datetime
+    STATUS_CHOICES = [
+        ('queued', 'Queued'),
+        ('running', 'Running'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ]
     
-    class Config:
-        from_attributes = True
-
-
-class ScanFindingBase(BaseModel):
-    scan_id: int
-    finding_id: int
-    detected_at: datetime
-
-
-class ScanFindingCreate(ScanFindingBase):
-    pass
-
-
-class ScanFinding(ScanFindingBase):
-    id: int
+    initiated_by = models.IntegerField(blank=True, null=True)  # User ID placeholder
+    scan_type = models.CharField(max_length=20, choices=SCAN_TYPE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='queued')
+    started_at = models.DateTimeField(blank=True, null=True)
+    finished_at = models.DateTimeField(blank=True, null=True)
+    duration_seconds = models.IntegerField(blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     
-    class Config:
-        from_attributes = True
-
-
-class CVEBase(BaseModel):
-    cve_id: str = Field(..., pattern=r'^CVE-\d{4}-\d{4,}$')
-    cvss_score: Optional[float] = None
-    cvss_vector: Optional[str] = None
-    description: Optional[str] = None
-    reference_url: Optional[str] = None
-    published_date: Optional[datetime] = None
-    last_modified: Optional[datetime] = None
-
-
-class CVECreate(CVEBase):
-    pass
-
-
-class CVE(CVEBase):
-    id: int
+    class Meta:
+        db_table = 'scans'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['scan_type']),
+            models.Index(fields=['-created_at']),
+        ]
     
-    class Config:
-        from_attributes = True
+    def __str__(self):
+        return f"Scan {self.id} - {self.status}"
 
 
-class FindingCVEBase(BaseModel):
-    finding_id: int
-    cve_id: int
-    relevance: str = Field(..., description="direct/indirect/related")
-
-
-class FindingCVECreate(FindingCVEBase):
-    pass
-
-
-class FindingCVE(FindingCVEBase):
-    id: int
+class ScanAsset(models.Model):
+    """Junction table linking scans to assets"""
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='scan_assets')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='asset_scans')
+    scan_started = models.DateTimeField(blank=True, null=True)
+    scan_completed = models.DateTimeField(blank=True, null=True)
     
-    class Config:
-        from_attributes = True
+    class Meta:
+        db_table = 'scan_assets'
+        unique_together = ['scan', 'asset']
+    
+    def __str__(self):
+        return f"Scan {self.scan_id} - Asset {self.asset_id}"
 
 
-# ============ SCANNING MODELS ============
+# ============================================
+# FINDING MODELS
+# ============================================
 
-class ScanRequest(BaseModel):
-    domain_ids: List[int] = Field(..., description="List of domain IDs to scan")
-    scan_type: ScanType = Field(default=ScanType.ON_DEMAND)
-    template_categories: Optional[List[str]] = Field(
-        default=None, 
-        description="Specific template categories to run"
-    )
-
-
-class NucleiResult(BaseModel):
-    template_id: str
-    template_name: str
-    severity: str
-    host: str
-    matched_at: str
-    evidence: Optional[str] = None
-    extracted_results: Optional[List[str]] = None
-    metadata: Optional[Dict[str, Any]] = None
-    cvss_score: Optional[float] = None
-    cve_ids: Optional[List[str]] = None
-
-
-class ScanResult(BaseModel):
-    scan_id: int
-    asset_id: int
-    findings: List[NucleiResult]
-    scan_duration: float
-    success: bool
-    error_message: Optional[str] = None
-
-
-# ============ SECURITY CHECK MODELS ============
-
-class SecurityHeaderFinding(BaseModel):
-    header: str
-    status: str  # "missing" or "present"
-    cvss_score: float
-    risk_rating: RiskRating
-    recommendation: str
-
-
-class EmailSecurityFinding(BaseModel):
-    check_type: str  # "SPF", "DKIM", "DMARC"
-    status: str  # "PASS", "FAIL", "INVALID"
-    details: Optional[str] = None
-    cvss_score: float
-    risk_rating: RiskRating
-
-
-class SSLSecurityFinding(BaseModel):
-    check_type: str  # "certificate", "protocol", "cipher", "hsts"
-    finding: str
-    example: Optional[str] = None
-    cvss_score: float
-    risk_rating: RiskRating
-
-
-class FrontendLibraryFinding(BaseModel):
-    library_name: str
-    detected_version: str
-    latest_version: str
-    vulnerability_status: str  # "up-to-date", "outdated", "vulnerable"
-    risk_level: RiskRating
-    source_urls: List[str]
+class Finding(models.Model):
+    """Security findings from scans"""
+    CATEGORY_CHOICES = [
+        ('CVE', 'CVE'),
+        ('SSL', 'SSL'),
+        ('DNS', 'DNS'),
+        ('Email', 'Email'),
+        ('Misconfiguration', 'Misconfiguration'),
+    ]
+    
+    RISK_RATING_CHOICES = [
+        ('Low', 'Low'),
+        ('Medium', 'Medium'),
+        ('High', 'High'),
+        ('Critical', 'Critical'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('open', 'Open'),
+        ('in_progress', 'In Progress'),
+        ('resolved', 'Resolved'),
+        ('false_positive', 'False Positive'),
+    ]
+    
+    CONFIDENCE_CHOICES = [
+        ('High', 'High'),
+        ('Medium', 'Medium'),
+        ('Low', 'Low'),
+    ]
+    
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='findings')
+    title = models.CharField(max_length=500)
+    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
+    nuclei_template_id = models.CharField(max_length=200)
+    nuclei_severity = models.CharField(max_length=50)
+    cvss_score = models.FloatField(blank=True, null=True)
+    cvss_vector = models.CharField(max_length=200, blank=True, null=True)
+    risk_rating = models.CharField(max_length=20, choices=RISK_RATING_CHOICES)
+    scoring_confidence = models.CharField(max_length=20, choices=CONFIDENCE_CHOICES)
+    evidence = models.TextField()
+    recommendation = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
+    first_seen = models.DateTimeField(auto_now_add=True)
+    last_seen = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'findings'
+        ordering = ['-cvss_score', '-first_seen']
+        indexes = [
+            models.Index(fields=['asset', 'category']),
+            models.Index(fields=['risk_rating']),
+            models.Index(fields=['status']),
+            models.Index(fields=['-cvss_score']),
+        ]
+    
+    def __str__(self):
+        return f"{self.title} - {self.risk_rating}"
 
 
-class DNSSecurityFinding(BaseModel):
-    check_type: str  # "zone_transfer", "dnssec", "hijacking", "subdomain_takeover"
-    finding: str
-    example: Optional[str] = None
-    cvss_score: float
-    risk_rating: RiskRating
+class ScanFinding(models.Model):
+    """Junction table linking scans to findings"""
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='scan_findings')
+    finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name='finding_scans')
+    detected_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'scan_findings'
+        unique_together = ['scan', 'finding']
+    
+    def __str__(self):
+        return f"Scan {self.scan_id} - Finding {self.finding_id}"
 
 
-# ============ REPORTING MODELS ============
-
-class ReportRequest(BaseModel):
-    domain_ids: List[int]
-    report_format: str = Field("pdf", pattern="^(pdf|doc|docx)$")
-    include_history: bool = Field(default=True)
-    custom_branding: Optional[Dict[str, Any]] = None
-
-
-class ReportSection(BaseModel):
-    title: str
-    content: str
-    order: int
-
-
-class GeneratedReport(BaseModel):
-    report_id: str
-    domain_ids: List[int]
-    report_format: str
-    generated_at: datetime
-    download_url: Optional[str] = None
-    sections: List[ReportSection]
+class CVE(models.Model):
+    """CVE database"""
+    cve_id = models.CharField(max_length=50, unique=True)  # e.g., CVE-2024-1234
+    cvss_score = models.FloatField(blank=True, null=True)
+    cvss_vector = models.CharField(max_length=200, blank=True, null=True)
+    description = models.TextField(blank=True, null=True)
+    reference_url = models.URLField(blank=True, null=True)
+    published_date = models.DateTimeField(blank=True, null=True)
+    last_modified = models.DateTimeField(blank=True, null=True)
+    
+    class Meta:
+        db_table = 'cves'
+        ordering = ['-published_date']
+        indexes = [
+            models.Index(fields=['cve_id']),
+            models.Index(fields=['-cvss_score']),
+        ]
+    
+    def __str__(self):
+        return self.cve_id
 
 
-# ============ ALERTING MODELS ============
-
-class AlertThreshold(BaseModel):
-    cvss_min: float
-    cvss_max: float
-    delivery_method: str
-    escalation_path: str
-
-
-class Alert(BaseModel):
-    alert_id: str
-    finding_id: int
-    severity: RiskRating
-    alert_type: str
-    message: str
-    created_at: datetime
-    acknowledged: bool = False
-    acknowledged_at: Optional[datetime] = None
-    delivery_channels: List[str]
-
-
-# ============ DASHBOARD MODELS ============
-
-class DashboardMetrics(BaseModel):
-    total_domains: int
-    active_vulnerabilities: int
-    high_risk_cves: int
-    scan_success_rate: float
-    vulnerability_distribution: Dict[RiskRating, int]
-    remediation_progress: Dict[str, int]
+class FindingCVE(models.Model):
+    """Links findings to CVEs"""
+    RELEVANCE_CHOICES = [
+        ('direct', 'Direct'),
+        ('indirect', 'Indirect'),
+        ('related', 'Related'),
+    ]
+    
+    finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name='finding_cves')
+    cve = models.ForeignKey(CVE, on_delete=models.CASCADE, related_name='cve_findings')
+    relevance = models.CharField(max_length=20, choices=RELEVANCE_CHOICES)
+    
+    class Meta:
+        db_table = 'finding_cves'
+        unique_together = ['finding', 'cve']
+    
+    def __str__(self):
+        return f"{self.finding.title} - {self.cve.cve_id}"
 
 
-class TrendDataPoint(BaseModel):
-    timestamp: datetime
-    value: int
-    category: str
+# ============================================
+# SPECIFIC CHECK RESULT MODELS
+# ============================================
+
+class FrontendLibraryCheck(models.Model):
+    """Frontend library vulnerability checks"""
+    VULNERABILITY_STATUS_CHOICES = [
+        ('up-to-date', 'Up-to-date'),
+        ('outdated', 'Outdated'),
+        ('vulnerable', 'Vulnerable'),
+    ]
+    
+    RISK_LEVEL_CHOICES = [
+        ('Low', 'Low'),
+        ('Medium', 'Medium'),
+        ('High', 'High'),
+        ('Critical', 'Critical'),
+    ]
+    
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='library_checks')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='library_checks')
+    library_name = models.CharField(max_length=200)
+    detected_version = models.CharField(max_length=100)
+    latest_version = models.CharField(max_length=100)
+    vulnerability_status = models.CharField(max_length=20, choices=VULNERABILITY_STATUS_CHOICES)
+    risk_level = models.CharField(max_length=20, choices=RISK_LEVEL_CHOICES)
+    source_urls = models.JSONField(default=list)
+    recommendation = models.TextField(blank=True)
+    checked_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'frontend_library_checks'
+        ordering = ['-checked_at']
+    
+    def __str__(self):
+        return f"{self.library_name} {self.detected_version}"
 
 
-class TrendAnalysis(BaseModel):
-    metric_name: str
-    data_points: List[TrendDataPoint]
-    trend_direction: str  # "improving", "worsening", "stable"
+class SSLTLSCheck(models.Model):
+    """SSL/TLS security checks"""
+    CHECK_TYPE_CHOICES = [
+        ('certificate', 'Certificate'),
+        ('protocol', 'Protocol'),
+        ('cipher', 'Cipher'),
+        ('hsts', 'HSTS'),
+    ]
+    
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='ssl_checks')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='ssl_checks')
+    check_type = models.CharField(max_length=50, choices=CHECK_TYPE_CHOICES)
+    finding = models.TextField()
+    example = models.TextField(blank=True)
+    cvss_score = models.FloatField()
+    risk_rating = models.CharField(max_length=20)
+    recommendation = models.TextField(blank=True)
+    checked_at = models.DateTimeField(auto_now_add=True)
+    
+    # Additional fields for certificate checks
+    certificate_expiry = models.DateTimeField(blank=True, null=True)
+    certificate_days_remaining = models.IntegerField(blank=True, null=True)
+    protocols_supported = models.JSONField(default=list)
+    weak_ciphers = models.JSONField(default=list)
+    
+    class Meta:
+        db_table = 'ssl_tls_checks'
+        ordering = ['-checked_at']
+    
+    def __str__(self):
+        return f"{self.check_type} - {self.asset.value}"
 
 
-# ============ COMPARISON MODELS ============
-
-class ScanComparison(BaseModel):
-    scan_a_id: int
-    scan_b_id: int
-    new_findings: List[Finding]
-    resolved_findings: List[Finding]
-    persistent_findings: List[Finding]
-    comparison_date: datetime
-
-
-class DomainComparison(BaseModel):
-    domain_a_id: int
-    domain_b_id: int
-    common_findings: List[Finding]
-    unique_to_a: List[Finding]
-    unique_to_b: List[Finding]
-
-
-# ============ BULK OPERATION MODELS ============
-
-class BulkDomainUpload(BaseModel):
-    domains: List[str]
-    registrar: Optional[str] = None
-    owner: Optional[str] = None
-    validate_dns: bool = Field(default=True)
-
-
-class BulkDomainResult(BaseModel):
-    domain: str
-    success: bool
-    domain_id: Optional[int] = None
-    error_message: Optional[str] = None
+class EmailSecurityCheck(models.Model):
+    """Email security (SPF, DKIM, DMARC) checks"""
+    CHECK_TYPE_CHOICES = [
+        ('SPF', 'SPF'),
+        ('DKIM', 'DKIM'),
+        ('DMARC', 'DMARC'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('PASS', 'Pass'),
+        ('FAIL', 'Fail'),
+        ('INVALID', 'Invalid'),
+    ]
+    
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='email_checks')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='email_checks')
+    check_type = models.CharField(max_length=20, choices=CHECK_TYPE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    details = models.TextField(blank=True)
+    cvss_score = models.FloatField()
+    risk_rating = models.CharField(max_length=20)
+    recommendation = models.TextField(blank=True)
+    record_value = models.TextField(blank=True)
+    checked_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'email_security_checks'
+        ordering = ['-checked_at']
+    
+    def __str__(self):
+        return f"{self.check_type} - {self.status}"
 
 
-class BulkScanRequest(BaseModel):
-    domain_ids: List[int]
-    scan_type: ScanType = Field(default=ScanType.ON_DEMAND)
-    priority: int = Field(default=1, ge=1, le=10)
+class SecurityHeaderCheck(models.Model):
+    """Security headers checks"""
+    STATUS_CHOICES = [
+        ('missing', 'Missing'),
+        ('present', 'Present'),
+        ('misconfigured', 'Misconfigured'),
+    ]
+    
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='header_checks')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='header_checks')
+    header = models.CharField(max_length=200)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    cvss_score = models.FloatField()
+    risk_rating = models.CharField(max_length=20)
+    recommendation = models.TextField()
+    header_value = models.TextField(blank=True)
+    checked_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'security_header_checks'
+        ordering = ['-checked_at']
+    
+    def __str__(self):
+        return f"{self.header} - {self.status}"
 
 
-# ============ TEMPLATE MANAGEMENT ============
-
-class NucleiTemplate(BaseModel):
-    id: str
-    name: str
-    category: str
-    severity: str
-    description: Optional[str] = None
-    cve_ids: Optional[List[str]] = None
-    cvss_score: Optional[float] = None
-    tags: List[str] = []
-    author: Optional[str] = None
-    version: str = "1.0"
-    false_positive_rate: Optional[float] = None
-    last_updated: datetime
-
-
-class TemplateUpdateRequest(BaseModel):
-    template_ids: List[str]
-    update_source: str = Field(..., description="cve_daily/security_weekly/config_monthly")
-    force_update: bool = False
-
-
-# ============ RESPONSE MODELS ============
-
-class ApiResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[Any] = None
-    error_code: Optional[str] = None
-
-
-class PaginatedResponse(BaseModel):
-    items: List[Any]
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
+class DNSSecurityCheck(models.Model):
+    """DNS security checks"""
+    CHECK_TYPE_CHOICES = [
+        ('zone_transfer', 'Zone Transfer'),
+        ('dnssec', 'DNSSEC'),
+        ('hijacking', 'DNS Hijacking'),
+        ('subdomain_takeover', 'Subdomain Takeover'),
+    ]
+    
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='dns_checks')
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='dns_checks')
+    check_type = models.CharField(max_length=50, choices=CHECK_TYPE_CHOICES)
+    finding = models.TextField()
+    example = models.TextField(blank=True)
+    cvss_score = models.FloatField()
+    risk_rating = models.CharField(max_length=20)
+    recommendation = models.TextField(blank=True)
+    checked_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'dns_security_checks'
+        ordering = ['-checked_at']
+    
+    def __str__(self):
+        return f"{self.check_type} - {self.asset.value}"
