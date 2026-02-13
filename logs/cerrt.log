@@ -139094,3 +139094,51 @@ NameError: name 'get_template_path' is not defined
 [WARNING] 2026-02-13 01:46:52 django.server "GET /health/ HTTP/1.1" 404 2347
 [WARNING] 2026-02-13 01:49:00 django.request Not Found: /health/
 [WARNING] 2026-02-13 01:49:00 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:50:01 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:50:01 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:52:29 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:52:29 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:53:29 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:53:29 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:55:00 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:55:00 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:56:18 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:56:18 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:58:29 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:58:29 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 01:59:29 django.request Not Found: /health/
+[WARNING] 2026-02-13 01:59:29 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:02:00 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:02:01 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:03:00 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:03:00 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:05:30 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:05:30 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:06:12 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:06:12 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:08:30 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:08:30 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:11:02 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:11:02 django.server "GET /health/ HTTP/1.1" 404 2347
+[INFO] 2026-02-13 02:12:17 django.server "GET /api/scans/90/ HTTP/1.1" 200 644
+[INFO] 2026-02-13 02:12:17 django.server "GET /api/scans/90/summary/ HTTP/1.1" 200 531
+[INFO] 2026-02-13 02:12:17 api.views Total findings matching filters: 0
+[INFO] 2026-02-13 02:12:17 api.views Returning 0 findings (page 1/0)
+[INFO] 2026-02-13 02:12:17 django.server "GET /api/scans/90/findings/ HTTP/1.1" 200 123
+[WARNING] 2026-02-13 02:13:31 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:13:31 django.server "GET /health/ HTTP/1.1" 404 2347
+[INFO] 2026-02-13 02:14:06 django.server "GET /api/domains/ HTTP/1.1" 200 698
+[INFO] 2026-02-13 02:14:09 django.server "GET /api/domains/ HTTP/1.1" 200 698
+[INFO] 2026-02-13 02:14:09 django.server "GET /api/scans/?limit=10 HTTP/1.1" 200 2172
+[WARNING] 2026-02-13 02:14:09 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:14:09 django.server "GET /health/ HTTP/1.1" 404 2347
+[INFO] 2026-02-13 02:15:06 django.server "GET /api/domains/ HTTP/1.1" 200 698
+[INFO] 2026-02-13 02:15:06 django.server "GET /api/scans/?limit=10 HTTP/1.1" 200 2172
+[INFO] 2026-02-13 02:15:47 django.server "GET /api/scans/?limit=10 HTTP/1.1" 200 2172
+[INFO] 2026-02-13 02:15:47 django.server "GET /api/domains/ HTTP/1.1" 200 698
+[WARNING] 2026-02-13 02:16:31 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:16:31 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:19:01 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:19:01 django.server "GET /health/ HTTP/1.1" 404 2347
+[WARNING] 2026-02-13 02:20:31 django.request Not Found: /health/
+[WARNING] 2026-02-13 02:20:31 django.server "GET /health/ HTTP/1.1" 404 2347
