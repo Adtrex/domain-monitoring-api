@@ -1,9 +1,6 @@
 """
-Open Source CVE Checker for CERRT
-Uses only free/open-source services:
-- OSV (Open Source Vulnerabilities) API - FREE
-- NVD (National Vulnerability Database) API - FREE
-- Retire.js database - FREE/Open Source
+Fixed Open Source CVE Checker for CERRT
+Uses only free/open-source services with improved library matching
 """
 
 import requests
@@ -17,6 +14,68 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================
+# Library Name Mapping (CRITICAL FIX)
+# ============================================
+
+# Map common frontend library names to their actual package names
+LIBRARY_NAME_MAPPING = {
+    # Frontend libraries that are in npm
+    'jquery': 'jquery',
+    'react': 'react',
+    'react-dom': 'react-dom',
+    'vue': 'vue',
+    'vue.js': 'vue',
+    'angular': '@angular/core',
+    'angularjs': 'angular',  # Old Angular 1.x
+    'lodash': 'lodash',
+    'moment': 'moment',
+    'moment.js': 'moment',
+    'axios': 'axios',
+    'bootstrap': 'bootstrap',
+    'd3': 'd3',
+    'd3.js': 'd3',
+    'chart.js': 'chart.js',
+    'three': 'three',
+    'three.js': 'three',
+    'socket.io': 'socket.io',
+    'express': 'express',
+    'webpack': 'webpack',
+    'next': 'next',
+    'nuxt': 'nuxt',
+    
+    # CSS frameworks
+    'font-awesome': 'font-awesome',
+    'bulma': 'bulma',
+    'tailwind': 'tailwindcss',
+    'tailwind css': 'tailwindcss',
+    
+    # Python packages
+    'django': 'Django',
+    'flask': 'Flask',
+    'requests': 'requests',
+    'numpy': 'numpy',
+    'pandas': 'pandas',
+    
+    # PHP packages
+    'symfony': 'symfony/symfony',
+    'laravel': 'laravel/framework',
+    
+    # WordPress
+    'wordpress': 'wordpress',
+
+    'aos': 'aos',
+    'gsap': 'gsap',
+    'swiper': 'swiper',
+}
+
+
+def normalize_library_name(library_name: str) -> str:
+    """Normalize library name for package registry lookup"""
+    library_lower = library_name.lower().strip()
+    return LIBRARY_NAME_MAPPING.get(library_lower, library_lower)
+
+
+# ============================================
 # OSV API (Primary - Best for Libraries)
 # ============================================
 
@@ -26,53 +85,67 @@ def check_library_vulnerabilities_osv(
     ecosystem: str = 'npm'
 ) -> List[Dict[str, Any]]:
     """
-    Check vulnerabilities using OSV API (Free, no API key needed!)
+    Check vulnerabilities using OSV API
     
-    Supported ecosystems:
-    - npm (JavaScript/Node.js)
-    - PyPI (Python)
-    - Maven (Java)
-    - Go
-    - RubyGems (Ruby)
-    - crates.io (Rust)
-    - Packagist (PHP)
-    - NuGet (.NET)
-    - Hex (Erlang/Elixir)
-    
-    Args:
-        library_name: Name of the library (e.g., 'jquery', 'react')
-        version: Version string (e.g., '3.6.0')
-        ecosystem: Package ecosystem (default: 'npm')
-    
-    Returns:
-        List of vulnerability dictionaries
+    FIXED: Proper ecosystem casing and better error handling
     """
     api_url = "https://api.osv.dev/v1/query"
     
     # Normalize library name
-    library_name = library_name.lower().strip()
+    library_name = normalize_library_name(library_name)
     version = version.strip()
+    
+    # Fix ecosystem casing - OSV is case-sensitive!
+    ecosystem_map = {
+        'npm': 'npm',
+        'pypi': 'PyPI',
+        'packagist': 'Packagist',
+        'rubygems': 'RubyGems',
+        'maven': 'Maven',
+        'go': 'Go',
+        'nuget': 'NuGet',
+        'cargo': 'crates.io',
+        'hex': 'Hex',
+    }
+    
+    ecosystem_normalized = ecosystem_map.get(ecosystem.lower(), 'npm')
     
     payload = {
         "package": {
             "name": library_name,
-            "ecosystem": ecosystem.upper()
+            "ecosystem": ecosystem_normalized
         },
         "version": version
     }
     
     try:
-        logger.info(f"Checking OSV for {library_name}@{version} in {ecosystem}")
+        logger.info(f"Checking OSV for {library_name}@{version} in {ecosystem_normalized}")
+        logger.debug(f"OSV Request payload: {json.dumps(payload, indent=2)}")
+        
         response = requests.post(api_url, json=payload, timeout=30)
         
+        logger.debug(f"OSV Response status: {response.status_code}")
+        logger.debug(f"OSV Response body: {response.text[:500]}")
+        
         if response.status_code != 200:
-            logger.warning(f"OSV API returned status {response.status_code}")
+            logger.warning(f"OSV API returned status {response.status_code}: {response.text[:200]}")
             return []
         
         data = response.json()
+
+        # logger.info("FULL OSV RESPONSE:")
+        # logger.info(json.dumps(data, indent=2, default=str))
+        
+        # Check if response has vulnerabilities
+        if not data.get('vulns'):
+            logger.info(f"No vulnerabilities found in OSV for {library_name}@{version}")
+            return []
         
         vulnerabilities = []
         for vuln in data.get('vulns', []):
+
+            # logger.info("RAW VULNERABILITY:")
+            # logger.info(json.dumps(vuln, indent=2, default=str))
             # Extract CVE IDs from aliases
             cve_ids = [
                 alias for alias in vuln.get('aliases', []) 
@@ -98,19 +171,33 @@ def check_library_vulnerabilities_osv(
                 'modified': vuln.get('modified'),
                 'source': 'OSV'
             })
+
+           
+
+            
+            logger.info(
+                f"Found vulnerability with CVSS {cvss_score}:\n{json.dumps(vuln, indent=2, default=str)}"
+            )
+
         
+
         logger.info(f"Found {len(vulnerabilities)} vulnerabilities for {library_name}@{version}")
         return vulnerabilities
         
+    except requests.exceptions.RequestException as e:
+        logger.error(f"OSV API request failed for {library_name}@{version}: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        logger.error(f"OSV API returned invalid JSON: {e}")
+        return []
     except Exception as e:
-        logger.error(f"OSV API failed for {library_name}@{version}: {e}")
+        logger.error(f"Unexpected error in OSV API: {e}")
         return []
 
 
 def extract_cvss_from_osv(vuln: Dict) -> float:
     """
     Extract CVSS score from OSV vulnerability data
-    Maps severity to approximate CVSS scores
     """
     severity_map = {
         'CRITICAL': 9.5,
@@ -121,18 +208,39 @@ def extract_cvss_from_osv(vuln: Dict) -> float:
         'UNKNOWN': 0.0
     }
     
-    # Try to get from database_specific
-    severity = vuln.get('database_specific', {}).get('severity', 'UNKNOWN')
+    # Try to get from severity field first
+    for sev in vuln.get('severity', []):
+        if sev.get('type') == 'CVSS_V3':
+            try:
+                score_str = sev.get('score', '')
+                # Parse CVSS vector string like "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                # For now, just look for baseScore in database_specific
+                pass
+            except:
+                pass
     
-    # Try to get actual CVSS if available
-    cvss_v3 = vuln.get('database_specific', {}).get('cvss_v3')
-    if cvss_v3:
+    # Try to get from database_specific
+    db_specific = vuln.get('database_specific', {})
+    
+    # Check for explicit CVSS score
+    if 'cvss_score' in db_specific:
         try:
-            return float(cvss_v3.get('baseScore', 0.0))
+            return float(db_specific['cvss_score'])
         except:
             pass
     
-    return severity_map.get(severity.upper(), 0.0)
+    # Try cvss_v3
+    if 'cvss_v3' in db_specific:
+        try:
+            cvss_v3 = db_specific['cvss_v3']
+            if isinstance(cvss_v3, dict) and 'baseScore' in cvss_v3:
+                return float(cvss_v3['baseScore'])
+        except:
+            pass
+    
+    # Fallback to severity mapping
+    severity_str = db_specific.get('severity', 'UNKNOWN')
+    return severity_map.get(severity_str.upper(), 0.0)
 
 
 def extract_affected_versions(affected_list: List[Dict]) -> List[str]:
@@ -164,26 +272,129 @@ def extract_fixed_versions(affected_list: List[Dict]) -> List[str]:
 
 
 # ============================================
-# NVD API (Secondary - More comprehensive)
+# Retire.js Database (Frontend Libraries)
 # ============================================
 
-def check_library_vulnerabilities_nvd(library_name: str, version: str) -> List[Dict[str, Any]]:
+def check_retirejs_vulnerabilities(library_name: str, version: str) -> List[Dict[str, Any]]:
     """
-    Check vulnerabilities using NVD (National Vulnerability Database) API
-    Free, no API key required (but rate limited)
+    Check vulnerabilities using Retire.js database
+    This is specifically good for frontend JavaScript libraries
+    """
+    # Retire.js repository URL
+    retirejs_url = "https://raw.githubusercontent.com/RetireJS/retire.js/master/repository/jsrepository.json"
     
-    Note: NVD is slower and has rate limits (5 requests per 30 seconds without API key)
+    try:
+        logger.info(f"Checking Retire.js database for {library_name}@{version}")
+        response = requests.get(retirejs_url, timeout=60)
+        
+        if response.status_code != 200:
+            logger.warning(f"Retire.js database fetch failed: {response.status_code}")
+            return []
+        
+        retire_data = response.json()
+
+        # logger.info("FULL RETIRE.JS RESPONSE:")
+        # logger.info(json.dumps(retire_data, indent=2, default=str))
+        
+        # Normalize library name
+        library_lower = library_name.lower()
+        
+        vulnerabilities = []
+        
+        # Search for the library in retire.js database
+        for lib_key, lib_data in retire_data.items():
+            if library_lower in lib_key.lower() or lib_key.lower() in library_lower:
+                # Found the library, now check vulnerabilities
+                for vuln in lib_data.get('vulnerabilities', []):
+
+
+                    # Check if current version is affected
+                    affected = False
+                    
+                    # Check "below" constraint
+                    below_version = vuln.get('below')
+                    if below_version:
+                        if version_compare(version, below_version) < 0:
+                            affected = True
+                    
+                    # Check "atOrAbove" constraint
+                    at_or_above = vuln.get('atOrAbove')
+                    if at_or_above:
+                        if version_compare(version, at_or_above) < 0:
+                            affected = False
+                    
+                    if affected:
+                        # Extract CVE IDs from identifiers
+                        cve_ids = []
+                        for identifier_type, identifier_list in vuln.get('identifiers', {}).items():
+                            if identifier_type == 'CVE':
+                                cve_ids = identifier_list
+                        
+                        severity = vuln.get('severity', 'medium').upper()
+                        
+                        vulnerabilities.append({
+                            'id': f"RETIRE-{lib_key}-{len(vulnerabilities)}",
+                            'cve_ids': cve_ids,
+                            'cve_id': cve_ids[0] if cve_ids else None,  # ← ADD THIS
+                            'primary_cve': cve_ids[0] if cve_ids else None,
+                            'summary': vuln.get('info', [''])[0] if vuln.get('info') else '',
+                            'details': '\n'.join(vuln.get('info', [])),
+                            'description': vuln.get('info', [''])[0] if vuln.get('info') else '',  # ← ADD THIS
+                            'severity': severity,
+                            'cvss_score': severity_to_cvss(severity),
+                            'cvss_vector': '',  # ← ADD THIS (empty for Retire.js)
+                            'affected_versions': [f"<{below_version}"] if below_version else [],
+                            'fixed_versions': [below_version] if below_version else [],
+                            'references': vuln.get('info', []),
+                            'source': 'Retire.js'
+                        })
+
+        logger.info("All Vulnurabilities found:")
+        logger.info(json.dumps(vulnerabilities, indent=2, default=str))
+        
+        logger.info(f"Found {len(vulnerabilities)} vulnerabilities in Retire.js for {library_name}@{version}")
+        return vulnerabilities
+        
+    except Exception as e:
+        logger.error(f"Retire.js check failed: {e}")
+        return []
+
+
+def severity_to_cvss(severity: str) -> float:
+    """Convert severity string to approximate CVSS score"""
+    severity_map = {
+        'CRITICAL': 9.5,
+        'HIGH': 7.5,
+        'MEDIUM': 5.0,
+        'LOW': 3.0,
+        'UNKNOWN': 0.0
+    }
+    return severity_map.get(severity.upper(), 5.0)
+
+
+# ============================================
+# NVD API with Better Querying
+# ============================================
+
+def check_library_vulnerabilities_nvd_cpe(library_name: str, version: str) -> List[Dict[str, Any]]:
+    """
+    Check NVD using CPE (Common Platform Enumeration) matching
+    More accurate than keyword search
     """
     base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     
-    # Search for CVEs mentioning this library
+    # Construct CPE match string
+    # Format: cpe:2.3:a:vendor:product:version
+    library_normalized = normalize_library_name(library_name)
+    
+    # Try keyword search with better filtering
     params = {
-        'keywordSearch': f"{library_name} {version}",
-        'resultsPerPage': 50
+        'keywordSearch': library_normalized,
+        'resultsPerPage': 20
     }
     
     try:
-        logger.info(f"Checking NVD for {library_name} {version}")
+        logger.info(f"Checking NVD for {library_name}")
         response = requests.get(base_url, params=params, timeout=30)
         
         if response.status_code != 200:
@@ -197,7 +408,15 @@ def check_library_vulnerabilities_nvd(library_name: str, version: str) -> List[D
             cve_data = item.get('cve', {})
             cve_id = cve_data.get('id')
             
-            # Get CVSS score (prefer v3.1, fallback to v3.0, then v2)
+            # Filter: Only include if library name appears in description
+            descriptions = cve_data.get('descriptions', [])
+            description = descriptions[0].get('value', '') if descriptions else ''
+            
+            # Check if this CVE actually relates to our library
+            if library_normalized.lower() not in description.lower():
+                continue
+            
+            # Get CVSS score
             cvss_score = 0.0
             cvss_vector = ''
             
@@ -214,10 +433,6 @@ def check_library_vulnerabilities_nvd(library_name: str, version: str) -> List[D
             elif 'cvssMetricV2' in metrics and metrics['cvssMetricV2']:
                 cvss_v2 = metrics['cvssMetricV2'][0]
                 cvss_score = cvss_v2.get('cvssData', {}).get('baseScore', 0.0)
-            
-            # Get description
-            descriptions = cve_data.get('descriptions', [])
-            description = descriptions[0].get('value', '') if descriptions else ''
             
             # Get references
             references = [
@@ -236,7 +451,7 @@ def check_library_vulnerabilities_nvd(library_name: str, version: str) -> List[D
                 'source': 'NVD'
             })
         
-        logger.info(f"Found {len(cves)} CVEs from NVD for {library_name}")
+        logger.info(f"Found {len(cves)} relevant CVEs from NVD for {library_name}")
         return cves
         
     except Exception as e:
@@ -259,75 +474,55 @@ def calculate_severity_from_cvss(cvss_score: float) -> str:
 
 
 # ============================================
-# Ecosystem Detection
+# Ecosystem Detection (FIXED)
 # ============================================
 
 def get_ecosystem_for_library(library_name: str) -> str:
-    """
-    Automatically determine ecosystem based on library name
-    """
+    """Automatically determine ecosystem based on library name"""
     library_lower = library_name.lower()
     
-    # JavaScript/Node.js libraries
-    js_libraries = [
+    # Frontend JavaScript libraries - these are in npm
+    frontend_libs = [
         'jquery', 'react', 'vue', 'angular', 'lodash', 'bootstrap', 
         'moment', 'axios', 'express', 'webpack', 'babel', 'typescript',
         'next', 'nuxt', 'svelte', 'ember', 'backbone', 'underscore',
-        'd3', 'chart', 'three', 'socket.io', 'redux', 'mobx'
+        'd3', 'chart', 'three', 'socket', 'redux', 'mobx', 'font-awesome',
+        'bulma', 'tailwind', 'aos', 'gsap', 'swiper'
     ]
     
-    # Python libraries
-    python_libraries = [
+    # Python packages
+    python_libs = [
         'django', 'flask', 'requests', 'numpy', 'pandas', 'scipy',
-        'tensorflow', 'pytorch', 'keras', 'sqlalchemy', 'celery',
-        'pillow', 'beautifulsoup', 'scrapy', 'pytest', 'fastapi'
+        'tensorflow', 'pytorch', 'keras', 'sqlalchemy', 'celery'
     ]
     
-    # PHP libraries
-    php_libraries = [
-        'symfony', 'laravel', 'wordpress', 'drupal', 'joomla',
-        'phpunit', 'composer', 'guzzle', 'monolog', 'twig'
-    ]
-    
-    # Ruby libraries
-    ruby_libraries = [
-        'rails', 'sinatra', 'devise', 'rspec', 'capybara',
-        'activerecord', 'sidekiq', 'puma', 'nokogiri'
-    ]
-    
-    # Java libraries
-    java_libraries = [
-        'spring', 'hibernate', 'junit', 'maven', 'gradle',
-        'jackson', 'log4j', 'slf4j', 'apache', 'guava'
-    ]
-    
-    if any(lib in library_lower for lib in js_libraries):
+    # Check for matches
+    if any(lib in library_lower for lib in frontend_libs):
         return 'npm'
-    elif any(lib in library_lower for lib in python_libraries):
+    elif any(lib in library_lower for lib in python_libs):
         return 'PyPI'
-    elif any(lib in library_lower for lib in php_libraries):
-        return 'Packagist'
-    elif any(lib in library_lower for lib in ruby_libraries):
-        return 'RubyGems'
-    elif any(lib in library_lower for lib in java_libraries):
-        return 'Maven'
     else:
-        return 'npm'  # Default to npm for frontend
+        return 'npm'  # Default for frontend
 
 
 # ============================================
-# Combined Check (Best Results)
+# Combined Check with All Sources
 # ============================================
 
 def check_library_vulnerabilities(
     library_name: str, 
     version: str, 
-    ecosystem: Optional[str] = None
+    ecosystem: Optional[str] = None,
+    use_all_sources: bool = True
 ) -> Dict[str, Any]:
     """
-    Check library vulnerabilities using multiple open-source services
+    Check library vulnerabilities using multiple sources
     
-    Returns comprehensive vulnerability report combining OSV and NVD data
+    Args:
+        library_name: Library name (e.g., 'jquery')
+        version: Version string (e.g., '3.6.0')
+        ecosystem: Package ecosystem ('npm', 'PyPI', etc.)
+        use_all_sources: If True, check all sources; if False, only OSV
     """
     # Auto-detect ecosystem if not provided
     if not ecosystem:
@@ -335,29 +530,34 @@ def check_library_vulnerabilities(
     
     logger.info(f"Checking vulnerabilities for {library_name}@{version} ({ecosystem})")
     
-    # Check OSV (primary source - better for libraries)
+    all_vulnerabilities = []
+    
+    # Source 1: OSV (Primary)
     osv_vulns = check_library_vulnerabilities_osv(library_name, version, ecosystem)
+    all_vulnerabilities.extend(osv_vulns)
     
-    # Check NVD (secondary source - more comprehensive CVE database)
-    # Note: Comment out if hitting rate limits
-    nvd_vulns = check_library_vulnerabilities_nvd(library_name, version)
-    
-    # Combine and deduplicate
-    all_vulnerabilities = osv_vulns + nvd_vulns
+    if use_all_sources:
+        # Source 2: Retire.js (Good for frontend)
+        if ecosystem.lower() == 'npm':
+            retirejs_vulns = check_retirejs_vulnerabilities(library_name, version)
+            all_vulnerabilities.extend(retirejs_vulns)
+        
+        # Source 3: NVD (Comprehensive but slower)
+        # Uncomment if you need more comprehensive results
+        # nvd_vulns = check_library_vulnerabilities_nvd_cpe(library_name, version)
+        # all_vulnerabilities.extend(nvd_vulns)
     
     # Deduplicate by CVE ID
     seen_cves = set()
     unique_vulns = []
     
     for vuln in all_vulnerabilities:
-        # Get CVE identifier
         cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
         
         if cve_id and cve_id not in seen_cves:
             seen_cves.add(cve_id)
             unique_vulns.append(vuln)
         elif not cve_id:
-            # Include non-CVE vulnerabilities from OSV
             unique_vulns.append(vuln)
     
     # Calculate overall risk
@@ -377,24 +577,8 @@ def check_library_vulnerabilities(
     }
 
 
-# ============================================
-# Bulk Library Checking
-# ============================================
-
 def check_multiple_libraries(libraries: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """
-    Check vulnerabilities for multiple libraries
-    
-    Args:
-        libraries: List of dicts with 'name', 'version', and optional 'ecosystem'
-        Example: [
-            {'name': 'jquery', 'version': '3.6.0'},
-            {'name': 'react', 'version': '17.0.2', 'ecosystem': 'npm'}
-        ]
-    
-    Returns:
-        List of vulnerability reports
-    """
+    """Check vulnerabilities for multiple libraries"""
     results = []
     
     for lib in libraries:
@@ -433,8 +617,12 @@ def version_compare(version1: str, version2: str) -> int:
     Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
     """
     try:
-        v1_parts = [int(x) for x in version1.split('.')]
-        v2_parts = [int(x) for x in version2.split('.')]
+        # Remove 'v' prefix if present
+        v1 = version1.lstrip('v')
+        v2 = version2.lstrip('v')
+        
+        v1_parts = [int(x) for x in v1.split('.') if x.isdigit()]
+        v2_parts = [int(x) for x in v2.split('.') if x.isdigit()]
         
         # Pad shorter version with zeros
         max_len = max(len(v1_parts), len(v2_parts))
@@ -458,92 +646,50 @@ def version_compare(version1: str, version2: str) -> int:
             return 0
 
 
-def is_version_affected(current_version: str, affected_ranges: List[str]) -> bool:
-    """
-    Check if current version is within affected ranges
-    
-    Args:
-        current_version: Current library version
-        affected_ranges: List of version ranges (e.g., ['>=1.0.0', '<2.0.0'])
-    """
-    is_affected = False
-    
-    for range_str in affected_ranges:
-        if range_str.startswith('>='):
-            min_version = range_str[2:]
-            if version_compare(current_version, min_version) >= 0:
-                is_affected = True
-        elif range_str.startswith('>'):
-            min_version = range_str[1:]
-            if version_compare(current_version, min_version) > 0:
-                is_affected = True
-        elif range_str.startswith('<='):
-            max_version = range_str[2:]
-            if version_compare(current_version, max_version) <= 0:
-                is_affected = True
-        elif range_str.startswith('<'):
-            max_version = range_str[1:]
-            if version_compare(current_version, max_version) < 0:
-                is_affected = True
-        elif range_str.startswith('=='):
-            exact_version = range_str[2:]
-            if current_version == exact_version:
-                is_affected = True
-    
-    return is_affected
-
-
 # ============================================
 # Example Usage
 # ============================================
 
 if __name__ == '__main__':
-    # Configure logging
+    # Configure logging with DEBUG level to see what's happening
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='[%(levelname)s] %(message)s'
     )
     
     print("\n" + "="*60)
-    print("CVE CHECKER TEST")
+    print("FIXED CVE CHECKER TEST")
     print("="*60 + "\n")
     
-    # Test single library
-    print("Testing: jQuery 3.6.0")
-    result = check_library_vulnerabilities('jquery', '3.6.0', 'npm')
-    
-    print(f"\nLibrary: {result['library']} v{result['version']}")
-    print(f"Ecosystem: {result['ecosystem']}")
-    print(f"Vulnerabilities Found: {result['vulnerability_count']}")
-    print(f"Max CVSS Score: {result['max_cvss_score']}")
-    print(f"Overall Severity: {result['overall_severity']}")
-    print(f"Is Vulnerable: {result['is_vulnerable']}")
-    
-    if result['vulnerabilities']:
-        print("\nVulnerabilities:")
-        for i, vuln in enumerate(result['vulnerabilities'][:3], 1):
-            cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
-            print(f"\n{i}. {cve_id}")
-            print(f"   CVSS: {vuln.get('cvss_score', 0.0)}")
-            print(f"   Severity: {vuln.get('severity', 'UNKNOWN')}")
-            print(f"   Summary: {vuln.get('summary', vuln.get('description', ''))[:100]}...")
-    
-    # Test multiple libraries
-    print("\n" + "="*60)
-    print("BULK TEST")
-    print("="*60 + "\n")
-    
-    libraries = [
-        {'name': 'jquery', 'version': '3.5.0'},
-        {'name': 'react', 'version': '16.8.0'},
-        {'name': 'lodash', 'version': '4.17.19'}
+    # Test with a library that has known vulnerabilities
+    test_cases = [
+        ('jquery', '3.4.0', 'npm'),      # Known vulnerable version
+        ('lodash', '4.17.15', 'npm'),    # Known vulnerable version
+        ('react', '16.13.0', 'npm'),     # Should have fewer/no vulns
+        ('moment', '2.29.1', 'npm'),     # Deprecated library
     ]
     
-    results = check_multiple_libraries(libraries)
-    
-    for result in results:
-        print(f"\n{result['library']} v{result['version']}: ", end='')
-        if result.get('error'):
-            print(f"ERROR - {result['error']}")
-        else:
-            print(f"{result['vulnerability_count']} vulnerabilities (CVSS: {result['max_cvss_score']})")
+    for lib_name, lib_version, lib_ecosystem in test_cases:
+        print(f"\n{'='*60}")
+        print(f"Testing: {lib_name} {lib_version}")
+        print('='*60)
+        
+        result = check_library_vulnerabilities(lib_name, lib_version, lib_ecosystem)
+        
+        print(f"\nLibrary: {result['library']} v{result['version']}")
+        print(f"Ecosystem: {result['ecosystem']}")
+        print(f"Vulnerabilities Found: {result['vulnerability_count']}")
+        print(f"Max CVSS Score: {result['max_cvss_score']}")
+        print(f"Overall Severity: {result['overall_severity']}")
+        print(f"Is Vulnerable: {result['is_vulnerable']}")
+        
+        if result['vulnerabilities']:
+            print("\nTop Vulnerabilities:")
+            for i, vuln in enumerate(result['vulnerabilities'][:3], 1):
+                cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
+                print(f"\n{i}. {cve_id}")
+                print(f"   CVSS: {vuln.get('cvss_score', 0.0)}")
+                print(f"   Severity: {vuln.get('severity', 'UNKNOWN')}")
+                summary = vuln.get('summary') or vuln.get('details') or vuln.get('description', '')
+                print(f"   Summary: {summary[:150]}...")
+                print(f"   Source: {vuln.get('source')}")

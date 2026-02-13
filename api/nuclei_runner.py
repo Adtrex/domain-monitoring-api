@@ -161,7 +161,7 @@ def parse_nuclei_result(result: Dict[str, Any]) -> Dict[str, Any]:
     info = result.get('info', {})
     classification = info.get('classification', {})
     
-    return {
+    parsed_result = {
         'template_id': result.get('template-id', ''),
         'template_name': info.get('name', ''),
         'severity': info.get('severity', 'info'),
@@ -177,6 +177,10 @@ def parse_nuclei_result(result: Dict[str, Any]) -> Dict[str, Any]:
         'timestamp': result.get('timestamp', ''),
         'raw_result': result  # Keep raw result for reference
     }
+    
+    logger.debug(f"Parsed Nuclei result: {parsed_result}")
+    
+    return parsed_result
 
 
 def categorize_template(template_id: str) -> str:
@@ -262,6 +266,9 @@ def get_check_type_from_template(template_id: str) -> str:
         return 'DKIM'
     elif 'dmarc' in template_id:
         return 'DMARC'
+
+    elif 'missing' in template_id and 'header' in template_id:
+        return 'security_header'
     
     # Default
     else:
@@ -372,6 +379,26 @@ def extract_certificate_info(result: Dict[str, Any]) -> Dict[str, Any]:
     return cert_info
 
 
+def extract_missing_header(template_id):
+    template_id = template_id.lower()
+
+    header_map = {
+        'content-security-policy': 'Content-Security-Policy',
+        'x-frame-options': 'X-Frame-Options',
+        'strict-transport-security': 'Strict-Transport-Security',
+        'x-content-type-options': 'X-Content-Type-Options',
+        'referrer-policy': 'Referrer-Policy',
+        'permissions-policy': 'Permissions-Policy'
+    }
+
+    for key, header in header_map.items():
+        if key in template_id:
+            return header
+
+    return None
+
+
+
 # Template mapping for friendly names to Nuclei paths
 TEMPLATE_MAP = {
     'ssl': 'ssl/',
@@ -445,3 +472,4 @@ if __name__ == '__main__':
     
     except Exception as e:
         print(f"Error: {e}")
+

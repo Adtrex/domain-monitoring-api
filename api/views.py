@@ -8,6 +8,9 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 import logging
+import re  # ← ADDED: Import re module for regex operations
+from .models import TechnologyCheck
+from .serializers import TechnologyCheckSerializer
 
 from .models import (
     Domain, Asset, Scan, ScanAsset, Finding, ScanFinding, CVE, FindingCVE,
@@ -23,7 +26,7 @@ from .serializers import (
 )
 
 # Import detection and scanning modules
-from .nuclei_runner import run_nuclei_scan
+from .nuclei_runner import run_nuclei_scan, get_template_path
 from .cve_checker import check_library_vulnerabilities, get_ecosystem_for_library
 from .library_detector import detect_technologies
 from .org_extractor import extract_organization_name
@@ -69,6 +72,28 @@ class ScanViewSet(viewsets.ModelViewSet):
     """
     queryset = Scan.objects.all()
     pagination_class = StandardPagination
+
+    def get_queryset(self):
+        """
+        Filter scans based on query parameters
+        """
+        queryset = super().get_queryset()
+        
+        # Filter by domain_id: returns scans that scanned assets belonging to this domain
+        domain_id = self.request.GET.get('domain_id')
+        if domain_id:
+            queryset = queryset.filter(
+                scan_assets__asset__domain_id=domain_id
+            ).distinct()
+        
+        # Filter by asset_id: returns scans that scanned this specific asset
+        asset_id = self.request.GET.get('asset_id')
+        if asset_id:
+            queryset = queryset.filter(
+                scan_assets__asset_id=asset_id
+            ).distinct()
+        
+        return queryset
     
     def get_serializer_class(self):
         if self.action == 'list':
@@ -154,6 +179,7 @@ class ScanViewSet(viewsets.ModelViewSet):
             'email_checks_count': scan.email_checks.count(),
             'header_checks_count': scan.header_checks.count(),
             'dns_checks_count': scan.dns_checks.count(),
+            'technology_checks_count': scan.technology_checks.count(),
             
             # Library statistics
             'libraries_up_to_date': scan.library_checks.filter(
@@ -197,6 +223,7 @@ class ScanViewSet(viewsets.ModelViewSet):
         check = scan.email_checks.filter(check_type=check_type).first()
         return check.status if check else 'NOT_CHECKED'
 
+    # @action(detail=True, methods=['post'])
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         """
@@ -213,6 +240,14 @@ class ScanViewSet(viewsets.ModelViewSet):
         
         # Get scan parameters
         templates = request.data.get('templates', ['ssl', 'dns', 'email'])
+        expanded_templates = []
+        for template in templates:
+            mapped = get_template_path(template)
+            if "," in mapped:
+                expanded_templates.extend(mapped.split(","))
+            else:
+                expanded_templates.append(mapped)
+        templates = expanded_templates
         check_libraries = request.data.get('check_libraries', True)
         check_cves = request.data.get('check_cves', True)
         extract_org = request.data.get('extract_org', True)
@@ -227,15 +262,466 @@ class ScanViewSet(viewsets.ModelViewSet):
         scan.save()
         
         try:
-            # Execute scan (same logic as execute_nuclei_scan)
+            # Execute scans for each asset
             for asset in assets:
-                results = run_nuclei_scan(asset.value, templates=templates)
-                _process_nuclei_results(scan, asset, results, templates)
+                logger.info(f"=== STARTING SCAN FOR {asset.value} ===")
                 
+                # 1. Extract organization name if requested
+                if extract_org:
+                    logger.info(f"🔍 Extracting organization name for {asset.value}")
+                    try:
+                        # Ensure we have a domain object
+                        if not hasattr(asset, 'domain') or asset.domain is None:
+                            logger.warning(f"⚠️ Asset {asset.id} has no associated domain - skipping org extraction")
+                        else:
+                            # Only extract if not already set
+                            if not asset.domain.owner:
+                                # Ensure URL has protocol for org extraction
+                                asset_url = asset.value
+                                if not asset_url.startswith(('http://', 'https://')):
+                                    asset_url = f'https://{asset_url}'
+                                    logger.info(f"Added protocol: {asset_url}")
+                                
+                                logger.info(f"Calling extract_organization_name for {asset_url}")
+                                org_name = extract_organization_name(asset_url)
+                                
+                                if org_name:
+                                    asset.domain.owner = org_name
+                                    asset.domain.save()
+                                    logger.info(f"✅ Organization saved: '{org_name}' for domain {asset.domain.root_domain}")
+                                else:
+                                    logger.warning(f"⚠️ Could not extract organization name for {asset_url}")
+                            else:
+                                logger.info(f"ℹ️ Organization already set: {asset.domain.owner}")
+                    except Exception as e:
+                        logger.error(f"❌ Org extraction failed for {asset.value}: {e}")
+                        import traceback
+                        logger.error(f"Traceback:\n{traceback.format_exc()}")
+                
+                # 2. Run Nuclei scan
+                logger.info(f"Running Nuclei scan on {asset.value}")
+                try:
+                    results = run_nuclei_scan(asset.value, templates=templates)
+                    _process_nuclei_results(scan, asset, results, templates)
+                    logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+                except Exception as e:
+                    logger.error(f"❌ Nuclei scan failed: {e}")
+                
+                # 3. Check for libraries and CVEs
                 if check_libraries:
-                    # Library detection logic here
-                    pass
-            
+                    logger.info(f"🔍 === LIBRARY DETECTION STARTED ===")
+                    
+                    try:
+                        # Ensure URL has protocol
+                        asset_url = asset.value
+                        if not asset_url.startswith(('http://', 'https://')):
+                            asset_url = f'https://{asset_url}'
+                            logger.info(f"Added protocol: {asset_url}")
+                        
+                        # Detect libraries and CMS
+                        logger.info(f"Calling detect_technologies for {asset_url}")
+                        tech_result = detect_technologies(asset_url)
+
+                        _process_technology_results(scan, asset, tech_result)
+                        
+                        detected_libraries = tech_result.get('libraries', [])
+                        detected_cms = tech_result.get('cms')
+                        
+                        logger.info(f"✓ Detected {len(detected_libraries)} libraries")
+                        
+                        if not detected_libraries:
+                            logger.warning("⚠️ No libraries detected - this might be normal for static sites")
+                        else:
+                            # Build library list string
+                            lib_list = ', '.join([f"{lib.get('name')}@{lib.get('version')}" for lib in detected_libraries])
+                            logger.info(f"Libraries found: {lib_list}")
+                        
+                        # Process each library - NEVER SKIP!
+                        for lib in detected_libraries:
+                            lib_name = lib.get('name')
+                            lib_version = lib.get('version', 'Unknown')  # Default to 'Unknown'
+                            lib_source = lib.get('source', 'unknown')
+                            
+                            logger.info(f"\n--- Processing: {lib_name}@{lib_version} (source: {lib_source}) ---")
+                            
+                            # Initialize defaults
+                            vulnerabilities = []
+                            vuln_status = 'unknown'
+                            risk_level = 'Low'
+                            max_cvss = 0.0
+                            recommendation = f"Version detection incomplete for {lib_name}"
+                            
+                            # Only check CVEs if we have a valid version
+                            can_check_cve = (
+                                lib_version and 
+                                lib_version.strip() != '' and
+                                lib_version.lower() not in ['unknown', 'latest', 'saas', 'n/a']
+                            )
+                            
+                            if can_check_cve and check_cves:
+                                logger.info(f"🔍 Checking CVEs for {lib_name}@{lib_version}")
+                                
+                                try:
+                                    # Normalize library name for CVE lookup
+                                    lib_name_normalized = lib_name.lower().strip()
+                                    lib_name_normalized = re.sub(r'\.(js|css)$', '', lib_name_normalized)
+                                    lib_name_normalized = re.sub(r'\s+', '-', lib_name_normalized)
+                                    
+                                    logger.info(f"Normalized: '{lib_name}' → '{lib_name_normalized}'")
+                                    
+                                    # Get ecosystem
+                                    ecosystem = get_ecosystem_for_library(lib_name_normalized)
+                                    logger.info(f"Ecosystem: {ecosystem}")
+                                    
+                                    # Check vulnerabilities
+                                    cve_result = check_library_vulnerabilities(
+                                        lib_name_normalized,
+                                        lib_version,
+                                        ecosystem,
+                                        use_all_sources=True
+                                    )
+                                    
+                                    vulnerabilities = cve_result.get('vulnerabilities', [])
+                                    max_cvss = cve_result.get('max_cvss_score', 0.0)
+                                    
+                                    logger.info(f"CVE check complete: {len(vulnerabilities)} vulns, max CVSS: {max_cvss}")
+                                    
+                                    if vulnerabilities:
+                                        vuln_status = 'vulnerable'
+                                        
+                                        # Determine risk level based on CVSS
+                                        if max_cvss >= 9.0:
+                                            risk_level = 'Critical'
+                                        elif max_cvss >= 7.0:
+                                            risk_level = 'High'
+                                        elif max_cvss >= 4.0:
+                                            risk_level = 'Medium'
+                                        else:
+                                            risk_level = 'Low'
+                                        
+                                        recommendation = f"Update {lib_name} immediately - {len(vulnerabilities)} CVEs found"
+                                        logger.info(f"⚠️ {len(vulnerabilities)} CVEs found - Risk: {risk_level}")
+                                        
+                                        # Log first 3 CVEs
+                                        for i, vuln in enumerate(vulnerabilities[:3], 1):
+                                            cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
+                                            logger.info(f"  {i}. {cve_id}: CVSS {vuln.get('cvss_score', 0.0)}")
+                                    else:
+                                        vuln_status = 'up-to-date'
+                                        recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
+                                        logger.info(f"✓ No CVEs found")
+                                        
+                                except Exception as e:
+                                    logger.error(f"❌ CVE check failed for {lib_name}: {e}")
+                                    import traceback
+                                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                                    vuln_status = 'check-failed'
+                                    recommendation = f"CVE check failed for {lib_name} - manual review recommended"
+                            
+                            else:
+                                # Can't check CVEs, but still save the library
+                                logger.warning(f"⚠️ Cannot check CVEs for {lib_name} (version: {lib_version})")
+                                vuln_status = 'unknown'
+                                recommendation = f"Manual version verification needed for {lib_name}"
+                            
+                            # ALWAYS create the library check record - NEVER SKIP
+                            library_check, created = FrontendLibraryCheck.objects.get_or_create(
+                                scan=scan,
+                                asset=asset,
+                                library_name=lib_name,
+                                detected_version=lib_version,
+                                defaults={
+                                    'latest_version': 'Unknown',
+                                    'vulnerability_status': vuln_status,
+                                    'risk_level': risk_level,
+                                    'source_urls': [lib.get('source_url', asset_url)],
+                                    'recommendation': recommendation
+                                }
+                            )
+                            
+                            if created:
+                                logger.info(f"✓✓✓ SAVED to DB: FrontendLibraryCheck id={library_check.id}")
+                                logger.info(f"✓ Created library check: {lib_name} v{lib_version} - {vuln_status} ({risk_level})")
+                            else:
+                                logger.info(f"ℹ️ Already exists: {lib_name} v{lib_version}")
+
+                            # ============================================================
+                            # VULNERABILITY PROCESSING
+                            # ============================================================
+                            logger.info(f"\n{'='*80}")
+                            logger.info(f"VULNERABILITY PROCESSING FOR {lib_name} v{lib_version}")
+                            logger.info(f"{'='*80}")
+                            logger.info(f"Total vulnerabilities found: {len(vulnerabilities)}")
+                            logger.info(f"Max CVSS score: {max_cvss}")
+                            logger.info(f"Risk level: {risk_level}")
+                            logger.info(f"Asset: {asset.value} (ID={asset.id})")
+                            logger.info(f"Scan: {scan.id}")
+
+                            if not vulnerabilities:
+                                logger.warning(f"⚠️ No vulnerabilities to process for {lib_name} v{lib_version}")
+                            else:
+                                logger.info(f"Processing {len(vulnerabilities)} vulnerabilities...")
+                                for i, v in enumerate(vulnerabilities, 1):
+                                    v_id = (
+                                        v.get('cve_id') or 
+                                        v.get('primary_cve') or 
+                                        (v.get('cve_ids', [None])[0] if v.get('cve_ids') else None) or
+                                        v.get('id', 'UNKNOWN')
+                                    )
+                                    v_cvss = v.get('cvss_score', 0.0)
+                                    v_source = v.get('source', 'UNKNOWN')
+                                    logger.info(f"  {i}. {v_id} (CVSS: {v_cvss}) [Source: {v_source}]")
+                            
+                            # Create findings for CVEs (only if vulnerabilities found)
+                            for idx, vuln in enumerate(vulnerabilities, 1):
+                                logger.info(f"\n{'='*60}")
+                                logger.info(f"Processing vulnerability {idx}/{len(vulnerabilities)} for {lib_name} v{lib_version}")
+                                
+                                # Extract vulnerability ID
+                                vuln_id = (
+                                    vuln.get('cve_id') or 
+                                    vuln.get('primary_cve') or 
+                                    (vuln.get('cve_ids', [None])[0] if vuln.get('cve_ids') else None) or
+                                    vuln.get('id', 'UNKNOWN')
+                                )
+
+                                # Determine if this is a CVE-based vulnerability
+                                is_cve_vulnerability = vuln_id and vuln_id.startswith('CVE-')
+
+                                logger.info(f"Vulnerability ID: {vuln_id} (CVE: {is_cve_vulnerability})")
+                                logger.info(f"Source: {vuln.get('source', 'UNKNOWN')}")
+                                
+                                # Extract CVSS score with fallback to severity mapping
+                                cvss_score = vuln.get('cvss_score', 0.0)
+                                if cvss_score is None or cvss_score == 0.0:
+                                    cvss_score = max_cvss
+
+                                try:
+                                    cvss_score = float(cvss_score)
+                                except (ValueError, TypeError):
+                                    cvss_score = 0.0
+
+                                # If still 0, use severity mapping
+                                if cvss_score == 0.0:
+                                    severity = vuln.get('severity', 'UNKNOWN').upper()
+                                    severity_map = {
+                                        'CRITICAL': 9.5,
+                                        'HIGH': 7.5,
+                                        'MEDIUM': 5.0,
+                                        'MODERATE': 5.0,
+                                        'LOW': 3.0,
+                                        'UNKNOWN': 0.0
+                                    }
+                                    cvss_score = severity_map.get(severity, 5.0)
+                                    logger.info(f"Using severity-based CVSS: {cvss_score} (from {severity})")
+
+                                cvss_vector = vuln.get('cvss_vector', '')
+
+                                logger.info(f"📊 CVSS Score: {cvss_score}")
+                                
+                                # Step 1: Create CVE record ONLY if this is a CVE vulnerability
+                                cve_record = None
+                                if is_cve_vulnerability:
+                                    logger.info(f"📝 Creating/updating CVE record for {vuln_id}")
+                                    cve_record, cve_created = CVE.objects.get_or_create(
+                                        cve_id=vuln_id,
+                                        defaults={
+                                            'cvss_score': cvss_score,
+                                            'cvss_vector': cvss_vector or '',
+                                            'description': (
+                                                vuln.get('summary') or 
+                                                vuln.get('description') or 
+                                                vuln.get('details', '')
+                                            )[:500],
+                                            'published_date': vuln.get('published'),
+                                            'last_modified': vuln.get('modified')
+                                        }
+                                    )
+                                    
+                                    if cve_created:
+                                        logger.info(f"✅ Created new CVE record: {vuln_id}")
+                                    else:
+                                        # Update existing CVE if we have better data
+                                        updated = False
+                                        if cvss_score > 0.0 and (not cve_record.cvss_score or cve_record.cvss_score == 0.0):
+                                            cve_record.cvss_score = cvss_score
+                                            updated = True
+                                        if cvss_vector and not cve_record.cvss_vector:
+                                            cve_record.cvss_vector = cvss_vector
+                                            updated = True
+                                        if updated:
+                                            cve_record.save()
+                                            logger.info(f"Updated CVE record: {vuln_id}")
+                                        else:
+                                            logger.info(f"CVE record already exists: {vuln_id}")
+                                else:
+                                    logger.info(f"Non-CVE vulnerability: {vuln_id} - will create Finding without CVE link")
+                                
+                                # Step 2: Create Finding - IMPROVED title for non-CVE vulnerabilities
+                                if is_cve_vulnerability:
+                                    finding_title = f"{lib_name} {lib_version} - {vuln_id}"
+                                else:
+                                    # For non-CVE vulnerabilities, use source and summary
+                                    source = vuln.get('source', 'Security')
+                                    summary = vuln.get('summary', 'Vulnerability')
+                                    
+                                    # Clean up summary for title (take first line or first 60 chars)
+                                    if summary:
+                                        summary_clean = summary.split('\n')[0].split('http')[0].strip()
+                                        if len(summary_clean) > 60:
+                                            summary_clean = summary_clean[:57] + '...'
+                                    else:
+                                        summary_clean = 'Vulnerability'
+                                    
+                                    finding_title = f"{lib_name} {lib_version} - {source} Vulnerability: {summary_clean}"
+
+                                logger.info(f"Finding title: {finding_title}")
+                                
+                                # FIXED: More specific deduplication - match exact title + asset
+                                existing_finding = Finding.objects.filter(
+                                    asset=asset,
+                                    title=finding_title,
+                                    category='CVE'
+                                ).first()
+                                
+                                if existing_finding:
+                                    logger.info(f"📎 Finding already exists (ID={existing_finding.id}): {finding_title}")
+                                    
+                                    # Link existing finding to current scan
+                                    scan_finding, sf_created = ScanFinding.objects.get_or_create(
+                                        scan=scan,
+                                        finding=existing_finding
+                                    )
+                                    if sf_created:
+                                        logger.info(f"✅ Linked existing finding to scan {scan.id}")
+                                    else:
+                                        logger.info(f"ℹ️ Finding already linked to scan {scan.id}")
+                                else:
+                                    # CREATE NEW FINDING
+                                    logger.info(f"💾 Creating new finding: {finding_title}")
+                                    logger.info(f"   Asset: {asset.value}")
+                                    logger.info(f"   CVSS Score: {cvss_score}")
+                                    logger.info(f"   Risk Level: {risk_level}")
+                                    
+                                    try:
+                                        # Get recommendation
+                                        recommendation_text = (
+                                            vuln.get('recommendation') or
+                                            vuln.get('remediation') or
+                                            vuln.get('details') or 
+                                            vuln.get('summary') or 
+                                            f'Update {lib_name} to a patched version'
+                                        )
+                                        
+                                        # Get evidence/description
+                                        evidence_text = (
+                                            vuln.get('summary') or
+                                            vuln.get('description') or
+                                            vuln.get('details') or
+                                            f"Vulnerable library: {lib_name} v{lib_version}"
+                                        )
+
+                                        # Add vulnerability source and references to evidence for non-CVE vulns
+                                        if not is_cve_vulnerability:
+                                            refs = vuln.get('references', [])
+                                            if refs:
+                                                evidence_text += f"\n\nReferences:\n" + "\n".join(refs[:3])
+
+                                        finding = Finding.objects.create(
+                                            asset=asset,
+                                            title=finding_title,
+                                            category='CVE',
+                                            nuclei_template_id='library-vuln-check',
+                                            nuclei_severity=vuln.get('severity', 'medium').lower(),
+                                            cvss_score=cvss_score,
+                                            cvss_vector=cvss_vector or '',
+                                            risk_rating=risk_level,
+                                            scoring_confidence='High',
+                                            evidence=evidence_text[:1000],
+                                            recommendation=recommendation_text[:500],
+                                            status='open'
+                                        )
+                                        
+                                        logger.info(f"✅✅✅ CREATED Finding ID={finding.id}: {finding_title}")
+                                        logger.info(f"   Database ID: {finding.id}")
+                                        logger.info(f"   CVSS Score in DB: {finding.cvss_score}")
+                                        
+                                        # Link finding to scan
+                                        scan_finding = ScanFinding.objects.create(
+                                            scan=scan, 
+                                            finding=finding
+                                        )
+                                        logger.info(f"✅ Linked finding to scan via ScanFinding ID={scan_finding.id}")
+                                        
+                                        # Link finding to CVE (ONLY if we have a CVE record)
+                                        if cve_record:
+                                            FindingCVE.objects.create(
+                                                finding=finding,
+                                                cve=cve_record,
+                                                relevance='direct'
+                                            )
+                                            logger.info(f"✅ Linked finding to CVE {vuln_id}")
+                                        else:
+                                            logger.info(f"ℹ️ Non-CVE vulnerability - no CVE link created")
+                                        
+                                        # Verify the finding was created
+                                        verify_finding = Finding.objects.filter(id=finding.id).first()
+                                        if verify_finding:
+                                            logger.info(f"✅ VERIFICATION: Finding exists in database")
+                                            logger.info(f"   Title: {verify_finding.title}")
+                                            logger.info(f"   CVSS: {verify_finding.cvss_score}")
+                                            logger.info(f"   Category: {verify_finding.category}")
+                                        else:
+                                            logger.error(f"❌ VERIFICATION FAILED: Finding not found in database!")
+                                            
+                                    except Exception as e:
+                                        logger.error(f"❌ FAILED to create finding: {e}")
+                                        import traceback
+                                        logger.error(f"Traceback:\n{traceback.format_exc()}")
+                            
+                            logger.info(f"\n{'='*80}")
+                            logger.info(f"FINISHED processing {len(vulnerabilities)} vulnerabilities for {lib_name}")
+                            logger.info(f"{'='*80}\n")
+                        
+                        # Store CMS info if detected
+                        if detected_cms:
+                            logger.info(f"🔍 Detected CMS: {detected_cms['name']} v{detected_cms['version']}")
+                            
+                            # Create informational finding for CMS
+                            if detected_cms['version'] not in ['Unknown', 'SaaS']:
+                                existing_cms_finding = Finding.objects.filter(
+                                    asset=asset,
+                                    title__icontains=f"{detected_cms['name']} CMS"
+                                ).first()
+                                
+                                if not existing_cms_finding:
+                                    finding = Finding.objects.create(
+                                        asset=asset,
+                                        title=f"{detected_cms['name']} CMS Detected - {detected_cms['version']}",
+                                        category='Misconfiguration',
+                                        nuclei_template_id='cms-detection',
+                                        nuclei_severity='info',
+                                        risk_rating='Low',
+                                        scoring_confidence='High',
+                                        evidence=f"CMS: {detected_cms['name']} v{detected_cms['version']}",
+                                        recommendation=f"Ensure {detected_cms['name']} is up to date and properly configured",
+                                        status='open'
+                                    )
+                                    ScanFinding.objects.create(scan=scan, finding=finding)
+                                    logger.info(f"✓ Created CMS finding")
+                                else:
+                                    # Link existing CMS finding to current scan
+                                    ScanFinding.objects.get_or_create(
+                                        scan=scan,
+                                        finding=existing_cms_finding
+                                    )
+                                    logger.info(f"📎 Linked existing CMS finding")
+                    
+                    except Exception as e:
+                        logger.error(f"❌ Library/CVE detection failed for {asset.value}: {e}")
+                        import traceback
+                        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+
             scan.status = 'completed'
             scan.finished_at = timezone.now()
             scan.duration_seconds = int((scan.finished_at - scan.started_at).total_seconds())
@@ -393,29 +879,172 @@ def scan_findings(request, scan_id):
     """
     Get all findings for a scan
     GET /api/scans/{scan_id}/findings/
+    
+    Query params:
+    - category: Filter by category (CVE, SSL, DNS, etc.)
+    - risk_rating: Filter by risk rating (Low, Medium, High, Critical)
+    - status: Filter by status (open, in_progress, resolved, false_positive)
+    - page: Page number (default: 1)
+    - page_size: Results per page (default: 100, max: 1000)
+    
+    FIXED: Now properly returns all findings with correct filtering
     """
     scan = get_object_or_404(Scan, id=scan_id)
-    scan_findings = ScanFinding.objects.filter(scan=scan).select_related('finding')
     
-    # Optional filtering
+    # ✅ FIXED: Use QuerySet methods for filtering BEFORE converting to list
+    scan_findings_qs = ScanFinding.objects.filter(
+        scan=scan
+    ).select_related('finding', 'finding__asset', 'finding__asset__domain')
+    
+    # Apply filters using QuerySet methods (DATABASE-LEVEL FILTERING)
     category = request.GET.get('category')
-    risk_rating = request.GET.get('risk_rating')
-    status_filter = request.GET.get('status')
-    
-    findings = [sf.finding for sf in scan_findings]
-    
     if category:
-        findings = [f for f in findings if f.category == category]
-    if risk_rating:
-        findings = [f for f in findings if f.risk_rating == risk_rating]
-    if status_filter:
-        findings = [f for f in findings if f.status == status_filter]
+        scan_findings_qs = scan_findings_qs.filter(finding__category=category)
+        logger.info(f"Filtering by category: {category}")
     
+    risk_rating = request.GET.get('risk_rating')
+    if risk_rating:
+        scan_findings_qs = scan_findings_qs.filter(finding__risk_rating=risk_rating)
+        logger.info(f"Filtering by risk_rating: {risk_rating}")
+    
+    status_filter = request.GET.get('status')
+    if status_filter:
+        scan_findings_qs = scan_findings_qs.filter(finding__status=status_filter)
+        logger.info(f"Filtering by status: {status_filter}")
+    
+    # Get total count BEFORE pagination
+    total_count = scan_findings_qs.count()
+    logger.info(f"Total findings matching filters: {total_count}")
+    
+    # Pagination
+    page = int(request.GET.get('page', 1))
+    page_size = min(int(request.GET.get('page_size', 100)), 1000)  # Max 1000
+    
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    
+    # Apply pagination to QuerySet
+    scan_findings_page = scan_findings_qs[start_idx:end_idx]
+    
+    # NOW convert to list (only for the current page)
+    findings = [sf.finding for sf in scan_findings_page]
+    
+    # Serialize
     serializer = FindingSerializer(findings, many=True)
+    
+    logger.info(f"Returning {len(findings)} findings (page {page}/{(total_count + page_size - 1) // page_size})")
+    
     return Response({
         'scan_id': scan_id,
-        'count': len(findings),
+        'total_count': total_count,
+        'page': page,
+        'page_size': page_size,
+        'total_pages': (total_count + page_size - 1) // page_size if total_count > 0 else 0,
+        'has_next': end_idx < total_count,
+        'has_previous': page > 1,
         'findings': serializer.data
+    })
+
+@api_view(['GET'])
+def all_findings(request):
+    """
+    Get all findings across all scans
+    GET /api/findings/
+    
+    NEW ENDPOINT: Allows querying all findings regardless of scan
+    
+    Query params:
+    - asset_id: Filter by asset
+    - domain_id: Filter by domain
+    - category: Filter by category
+    - risk_rating: Filter by risk rating
+    - status: Filter by status
+    - search: Search in title/evidence/recommendation
+    - min_cvss: Minimum CVSS score
+    - max_cvss: Maximum CVSS score
+    - page: Page number
+    - page_size: Results per page (max 1000)
+    """
+    findings_qs = Finding.objects.all().select_related('asset', 'asset__domain')
+    
+    # Filters
+    asset_id = request.GET.get('asset_id')
+    if asset_id:
+        findings_qs = findings_qs.filter(asset_id=asset_id)
+    
+    domain_id = request.GET.get('domain_id')
+    if domain_id:
+        findings_qs = findings_qs.filter(asset__domain_id=domain_id)
+    
+    category = request.GET.get('category')
+    if category:
+        findings_qs = findings_qs.filter(category=category)
+    
+    risk_rating = request.GET.get('risk_rating')
+    if risk_rating:
+        findings_qs = findings_qs.filter(risk_rating=risk_rating)
+    
+    status_filter = request.GET.get('status')
+    if status_filter:
+        findings_qs = findings_qs.filter(status=status_filter)
+    
+    search = request.GET.get('search')
+    if search:
+        findings_qs = findings_qs.filter(
+            Q(title__icontains=search) | 
+            Q(evidence__icontains=search) |
+            Q(recommendation__icontains=search)
+        )
+    
+    # CVSS range filters
+    min_cvss = request.GET.get('min_cvss')
+    if min_cvss:
+        findings_qs = findings_qs.filter(cvss_score__gte=float(min_cvss))
+    
+    max_cvss = request.GET.get('max_cvss')
+    if max_cvss:
+        findings_qs = findings_qs.filter(cvss_score__lte=float(max_cvss))
+    
+    # Order by CVSS score (highest first), then by date
+    findings_qs = findings_qs.order_by('-cvss_score', '-first_seen')
+    
+    # Count
+    total_count = findings_qs.count()
+    
+    # Pagination
+    page = int(request.GET.get('page', 1))
+    page_size = min(int(request.GET.get('page_size', 100)), 1000)
+    
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    
+    findings_page = findings_qs[start_idx:end_idx]
+    
+    serializer = FindingSerializer(findings_page, many=True)
+    
+    return Response({
+        'total_count': total_count,
+        'page': page,
+        'page_size': page_size,
+        'total_pages': (total_count + page_size - 1) // page_size if total_count > 0 else 0,
+        'has_next': end_idx < total_count,
+        'has_previous': page > 1,
+        'findings': serializer.data
+    })
+
+@api_view(['GET'])
+def scan_technology_checks(request, scan_id):
+
+    scan = get_object_or_404(Scan, id=scan_id)
+
+    checks = TechnologyCheck.objects.filter(scan=scan).select_related('asset')
+
+    serializer = TechnologyCheckSerializer(checks, many=True)
+
+    return Response({
+        'scan_id': scan_id,
+        'count': checks.count(),
+        'checks': serializer.data
     })
 
 
@@ -428,14 +1057,14 @@ def execute_nuclei_scan(request):
     """
     Execute comprehensive security scan including:
     - Nuclei vulnerability scanning
-    - Frontend library detection
+    - Frontend library detection  
     - CVE vulnerability checking
     - Organization name extraction
     
     POST /api/nuclei/scan/
     Body: {
-        "asset_ids": [1, 2],
-        "templates": ["ssl", "dns", "email", "headers"],
+        "asset_ids": [1, 2],  # ← REQUIRED!
+        "templates": ["ssl", "dns", "email"],
         "scan_type": "on-demand",
         "check_libraries": true,
         "check_cves": true,
@@ -444,14 +1073,26 @@ def execute_nuclei_scan(request):
     """
     asset_ids = request.data.get('asset_ids', [])
     templates = request.data.get('templates', ['ssl'])
+    expanded_templates = []
+    for template in templates:
+        mapped = get_template_path(template)
+
+        # Handle comma separated template paths
+        if "," in mapped:
+            expanded_templates.extend(mapped.split(","))
+        else:
+            expanded_templates.append(mapped)
+
+    templates = expanded_templates
     scan_type = request.data.get('scan_type', 'on-demand')
     check_libraries = request.data.get('check_libraries', True)
     check_cves = request.data.get('check_cves', True)
     extract_org = request.data.get('extract_org', True)
     
+    # CRITICAL: Validate asset_ids
     if not asset_ids:
         return Response(
-            {'error': 'asset_ids required'},
+            {'error': 'asset_ids required - must provide at least one asset ID'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
@@ -459,7 +1100,7 @@ def execute_nuclei_scan(request):
     assets = Asset.objects.filter(id__in=asset_ids)
     if not assets.exists():
         return Response(
-            {'error': 'No valid assets found'},
+            {'error': f'No valid assets found for IDs: {asset_ids}'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
@@ -477,71 +1118,132 @@ def execute_nuclei_scan(request):
     try:
         # Execute scans for each asset
         for asset in assets:
-            logger.info(f"Starting scan for asset: {asset.value}")
+            logger.info(f"=== STARTING SCAN FOR {asset.value} ===")
             
             # 1. Extract organization name if requested
-            if extract_org and not asset.domain.owner:
-                logger.info(f"Extracting organization name for {asset.value}")
-                org_name = extract_organization_name(asset.value)
-                if org_name:
-                    asset.domain.owner = org_name
-                    asset.domain.save()
-                    logger.info(f"Organization detected: {org_name}")
-            
+            if extract_org:
+                logger.info(f"🔍 Extracting organization name for {asset.value}")
+                try:
+                    # Ensure we have a domain object
+                    if not hasattr(asset, 'domain') or asset.domain is None:
+                        logger.warning(f"⚠️ Asset {asset.id} has no associated domain - skipping org extraction")
+                    else:
+                        # Only extract if not already set
+                        if not asset.domain.owner:
+                            # Ensure URL has protocol for org extraction
+                            asset_url = asset.value
+                            if not asset_url.startswith(('http://', 'https://')):
+                                asset_url = f'https://{asset_url}'
+                                logger.info(f"Added protocol: {asset_url}")
+                            
+                            logger.info(f"Calling extract_organization_name for {asset_url}")
+                            org_name = extract_organization_name(asset_url)
+                            
+                            if org_name:
+                                asset.domain.owner = org_name
+                                asset.domain.save()
+                                logger.info(f"✅ Organization saved: '{org_name}' for domain {asset.domain.root_domain}")
+                            else:
+                                logger.warning(f"⚠️ Could not extract organization name for {asset_url}")
+                        else:
+                            logger.info(f"ℹ️ Organization already set: {asset.domain.owner}")
+                except Exception as e:
+                    logger.error(f"❌ Org extraction failed for {asset.value}: {e}")
+                    import traceback
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+
             # 2. Run Nuclei scan
             logger.info(f"Running Nuclei scan on {asset.value}")
-            results = run_nuclei_scan(asset.value, templates=templates)
-            _process_nuclei_results(scan, asset, results, templates)
+            try:
+                results = run_nuclei_scan(asset.value, templates=templates)
+                _process_nuclei_results(scan, asset, results, templates)
+                logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+            except Exception as e:
+                logger.error(f"❌ Nuclei scan failed: {e}")
             
             # 3. Check for libraries and CVEs
             if check_libraries:
-                logger.info(f"Detecting libraries for {asset.value}")
+                logger.info(f"🔍 === LIBRARY DETECTION STARTED ===")
                 
                 try:
+                    # Ensure URL has protocol
+                    asset_url = asset.value
+                    if not asset_url.startswith(('http://', 'https://')):
+                        asset_url = f'https://{asset_url}'
+                        logger.info(f"Added protocol: {asset_url}")
+                    
                     # Detect libraries and CMS
-                    tech_result = detect_technologies(asset.value)
+                    logger.info(f"Calling detect_technologies for {asset_url}")
+                    tech_result = detect_technologies(asset_url)
+
+                    _process_technology_results(scan, asset, tech_result)
+                    
                     detected_libraries = tech_result.get('libraries', [])
                     detected_cms = tech_result.get('cms')
                     
-                    logger.info(f"Detected {len(detected_libraries)} libraries")
+                    logger.info(f"✓ Detected {len(detected_libraries)} libraries")
                     
-                    # Process each library
+                    if not detected_libraries:
+                        logger.warning("⚠️ No libraries detected - this might be normal for static sites")
+                    else:
+                        # Build library list string
+                        lib_list = ', '.join([f"{lib.get('name')}@{lib.get('version')}" for lib in detected_libraries])
+                        logger.info(f"Libraries found: {lib_list}")
+                    
+                    # Process each library - NEVER SKIP!
                     for lib in detected_libraries:
                         lib_name = lib.get('name')
-                        lib_version = lib.get('version')
+                        lib_version = lib.get('version', 'Unknown')  # Default to 'Unknown'
+                        lib_source = lib.get('source', 'unknown')
                         
-                        # Skip if no version
-                        if not lib_version or lib_version.lower() in ['unknown', 'latest']:
-                            logger.warning(f"Skipping {lib_name} - no version detected")
-                            continue
+                        logger.info(f"\n--- Processing: {lib_name}@{lib_version} (source: {lib_source}) ---")
                         
-                        # Check for CVEs if enabled
+                        # Initialize defaults
                         vulnerabilities = []
-                        vuln_status = 'up-to-date'
+                        vuln_status = 'unknown'
                         risk_level = 'Low'
                         max_cvss = 0.0
+                        recommendation = f"Version detection incomplete for {lib_name}"
                         
-                        if check_cves:
-                            logger.info(f"Checking CVEs for {lib_name}@{lib_version}")
+                        # Only check CVEs if we have a valid version
+                        can_check_cve = (
+                            lib_version and 
+                            lib_version.strip() != '' and
+                            lib_version.lower() not in ['unknown', 'latest', 'saas', 'n/a']
+                        )
+                        
+                        if can_check_cve and check_cves:
+                            logger.info(f"🔍 Checking CVEs for {lib_name}@{lib_version}")
                             
                             try:
+                                # Normalize library name for CVE lookup
+                                lib_name_normalized = lib_name.lower().strip()
+                                lib_name_normalized = re.sub(r'\.(js|css)$', '', lib_name_normalized)
+                                lib_name_normalized = re.sub(r'\s+', '-', lib_name_normalized)
+                                
+                                logger.info(f"Normalized: '{lib_name}' → '{lib_name_normalized}'")
+                                
                                 # Get ecosystem
-                                ecosystem = get_ecosystem_for_library(lib_name)
+                                ecosystem = get_ecosystem_for_library(lib_name_normalized)
+                                logger.info(f"Ecosystem: {ecosystem}")
                                 
                                 # Check vulnerabilities
                                 cve_result = check_library_vulnerabilities(
-                                    lib_name.lower(),
+                                    lib_name_normalized,
                                     lib_version,
-                                    ecosystem
+                                    ecosystem,
+                                    use_all_sources=True
                                 )
                                 
                                 vulnerabilities = cve_result.get('vulnerabilities', [])
                                 max_cvss = cve_result.get('max_cvss_score', 0.0)
                                 
+                                logger.info(f"CVE check complete: {len(vulnerabilities)} vulns, max CVSS: {max_cvss}")
+                                
                                 if vulnerabilities:
                                     vuln_status = 'vulnerable'
                                     
-                                    # Determine risk level from CVSS
+                                    # Determine risk level based on CVSS
                                     if max_cvss >= 9.0:
                                         risk_level = 'Critical'
                                     elif max_cvss >= 7.0:
@@ -551,100 +1253,312 @@ def execute_nuclei_scan(request):
                                     else:
                                         risk_level = 'Low'
                                     
-                                    logger.info(f"Found {len(vulnerabilities)} CVEs for {lib_name} (Max CVSS: {max_cvss})")
+                                    recommendation = f"Update {lib_name} immediately - {len(vulnerabilities)} CVEs found"
+                                    logger.info(f"⚠️ {len(vulnerabilities)} CVEs found - Risk: {risk_level}")
+                                    
+                                    # Log first 3 CVEs
+                                    for i, vuln in enumerate(vulnerabilities[:3], 1):
+                                        cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
+                                        logger.info(f"  {i}. {cve_id}: CVSS {vuln.get('cvss_score', 0.0)}")
                                 else:
-                                    logger.info(f"No CVEs found for {lib_name}@{lib_version}")
-                            
+                                    vuln_status = 'up-to-date'
+                                    recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
+                                    logger.info(f"✓ No CVEs found")
+                                    
                             except Exception as e:
-                                logger.error(f"CVE check failed for {lib_name}: {e}")
+                                logger.error(f"❌ CVE check failed for {lib_name}: {e}")
+                                import traceback
+                                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                                vuln_status = 'check-failed'
+                                recommendation = f"CVE check failed for {lib_name} - manual review recommended"
                         
-                        # Create library check record (avoid duplicates)
-                        existing_check = FrontendLibraryCheck.objects.filter(
+                        else:
+                            # Can't check CVEs, but still save the library
+                            logger.warning(f"⚠️ Cannot check CVEs for {lib_name} (version: {lib_version})")
+                            vuln_status = 'unknown'
+                            recommendation = f"Manual version verification needed for {lib_name}"
+                        
+                        # ALWAYS create the library check record - NEVER SKIP
+                        library_check, created = FrontendLibraryCheck.objects.get_or_create(
                             scan=scan,
                             asset=asset,
                             library_name=lib_name,
-                            detected_version=lib_version
-                        ).first()
+                            detected_version=lib_version,
+                            defaults={
+                                'latest_version': 'Unknown',
+                                'vulnerability_status': vuln_status,
+                                'risk_level': risk_level,
+                                'source_urls': [lib.get('source_url', asset_url)],
+                                'recommendation': recommendation
+                            }
+                        )
                         
-                        if not existing_check:
-                            library_check = FrontendLibraryCheck.objects.create(
-                                scan=scan,
-                                asset=asset,
-                                library_name=lib_name,
-                                detected_version=lib_version,
-                                latest_version='Unknown',
-                                vulnerability_status=vuln_status,
-                                risk_level=risk_level,
-                                source_urls=[lib.get('source_url', asset.value)],
-                                recommendation=f"{'Update immediately' if risk_level in ['Critical', 'High'] else 'Monitor'} {lib_name}"
-                            )
-                            logger.info(f"Created library check: {lib_name} v{lib_version} - {vuln_status}")
+                        if created:
+                            logger.info(f"✓✓✓ SAVED to DB: FrontendLibraryCheck id={library_check.id}")
+                            logger.info(f"✓ Created library check: {lib_name} v{lib_version} - {vuln_status} ({risk_level})")
+                        else:
+                            logger.info(f"ℹ️ Already exists: {lib_name} v{lib_version}")
+
+                        # ============================================================
+                        # VULNERABILITY PROCESSING - IMPROVED CVE ID EXTRACTION
+                        # ============================================================
+                        logger.info(f"\n{'='*80}")
+                        logger.info(f"VULNERABILITY PROCESSING FOR {lib_name} v{lib_version}")
+                        logger.info(f"{'='*80}")
+                        logger.info(f"Total vulnerabilities found: {len(vulnerabilities)}")
+                        logger.info(f"Max CVSS score: {max_cvss}")
+                        logger.info(f"Risk level: {risk_level}")
+                        logger.info(f"Asset: {asset.value} (ID={asset.id})")
+                        logger.info(f"Scan: {scan.id}")
+
+                        if not vulnerabilities:
+                            logger.warning(f"⚠️ No vulnerabilities to process for {lib_name} v{lib_version}")
+                        else:
+                            logger.info(f"Processing {len(vulnerabilities)} vulnerabilities...")
+                            # Print summary of vulnerabilities with IMPROVED extraction
+                            for i, v in enumerate(vulnerabilities, 1):
+                                # ✅ FIXED: Try multiple fields for CVE ID extraction
+                                v_id = (
+                                    v.get('cve_id') or 
+                                    v.get('primary_cve') or 
+                                    (v.get('cve_ids', [None])[0] if v.get('cve_ids') else None) or
+                                    v.get('id', 'UNKNOWN')
+                                )
+                                v_cvss = v.get('cvss_score', 0.0)
+                                v_source = v.get('source', 'UNKNOWN')
+                                logger.info(f"  {i}. {v_id} (CVSS: {v_cvss}) [Source: {v_source}]")
                         
-                        # Create findings and link CVEs
-                        for vuln in vulnerabilities:
-                            cve_id = (
+                        
+                        # Create findings for CVEs (only if vulnerabilities found)
+                        for idx, vuln in enumerate(vulnerabilities, 1):
+                            logger.info(f"\n{'='*60}")
+                            logger.info(f"Processing vulnerability {idx}/{len(vulnerabilities)} for {lib_name} v{lib_version}")
+                            
+                            # ✅ FIXED: Extract CVE ID with IMPROVED handling for Retire.js
+                            # cve_id = (
+                            #     vuln.get('cve_id') or                                          # OSV format / Fixed Retire.js
+                            #     vuln.get('primary_cve') or                                     # Retire.js (original)
+                            #     (vuln.get('cve_ids', [None])[0] if vuln.get('cve_ids') else None) or  # ← NEW: Handle list
+                            #     vuln.get('id', 'UNKNOWN')                                      # Fallback
+                            # )
+                            
+                            # logger.info(f"CVE ID: {cve_id}")
+                            # logger.info(f"Source: {vuln.get('source', 'UNKNOWN')}")
+
+                            # Extract vulnerability ID
+                            vuln_id = (
                                 vuln.get('cve_id') or 
                                 vuln.get('primary_cve') or 
+                                (vuln.get('cve_ids', [None])[0] if vuln.get('cve_ids') else None) or
                                 vuln.get('id', 'UNKNOWN')
                             )
+
+                            # Determine if this is a CVE-based vulnerability
+                            is_cve_vulnerability = vuln_id and vuln_id.startswith('CVE-')
+
+                            logger.info(f"Vulnerability ID: {vuln_id} (CVE: {is_cve_vulnerability})")
+                            logger.info(f"Source: {vuln.get('source', 'UNKNOWN')}")
                             
+                            # Debug: Print vulnerability structure if needed
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"Vulnerability data: {json.dumps(vuln, indent=2, default=str)}")
+                            
+                            # Extract CVSS score with fallback to severity mapping
                             cvss_score = vuln.get('cvss_score', 0.0)
+                            if cvss_score is None or cvss_score == 0.0:
+                                cvss_score = max_cvss
+
+                            try:
+                                cvss_score = float(cvss_score)
+                            except (ValueError, TypeError):
+                                cvss_score = 0.0
+
+                            # If still 0, use severity mapping
+                            if cvss_score == 0.0:
+                                severity = vuln.get('severity', 'UNKNOWN').upper()
+                                severity_map = {
+                                    'CRITICAL': 9.5,
+                                    'HIGH': 7.5,
+                                    'MEDIUM': 5.0,
+                                    'MODERATE': 5.0,
+                                    'LOW': 3.0,
+                                    'UNKNOWN': 0.0
+                                }
+                                cvss_score = severity_map.get(severity, 5.0)
+                                logger.info(f"Using severity-based CVSS: {cvss_score} (from {severity})")
+
                             cvss_vector = vuln.get('cvss_vector', '')
+
+                            logger.info(f"📊 CVSS Score: {cvss_score}")
                             
-                            # Get or create CVE record
-                            if cve_id and cve_id.startswith('CVE-'):
-                                cve_record, created = CVE.objects.get_or_create(
-                                    cve_id=cve_id,
+                            # Step 1: Create CVE record ONLY if this is a CVE vulnerability
+                            cve_record = None
+                            if is_cve_vulnerability:
+                                logger.info(f"📝 Creating/updating CVE record for {vuln_id}")
+                                cve_record, cve_created = CVE.objects.get_or_create(
+                                    cve_id=vuln_id,
                                     defaults={
                                         'cvss_score': cvss_score,
-                                        'cvss_vector': cvss_vector,
-                                        'description': vuln.get('summary', vuln.get('description', vuln.get('details', '')))[:500],
+                                        'cvss_vector': cvss_vector or '',
+                                        'description': (
+                                            vuln.get('summary') or 
+                                            vuln.get('description') or 
+                                            vuln.get('details', '')
+                                        )[:500],
                                         'published_date': vuln.get('published'),
                                         'last_modified': vuln.get('modified')
                                     }
                                 )
                                 
-                                if created:
-                                    logger.info(f"Created new CVE record: {cve_id}")
+                                if cve_created:
+                                    logger.info(f"✅ Created new CVE record: {cve_id}")
+                                else:
+                                    # Update existing CVE if we have better data
+                                    updated = False
+                                    if cvss_score > 0.0 and (not cve_record.cvss_score or cve_record.cvss_score == 0.0):
+                                        cve_record.cvss_score = cvss_score
+                                        updated = True
+                                    if cvss_vector and not cve_record.cvss_vector:
+                                        cve_record.cvss_vector = cvss_vector
+                                        updated = True
+                                    if updated:
+                                        cve_record.save()
+                                        logger.info(f"Updated CVE record: {cve_id}")
+                                    else:
+                                        logger.info(f"CVE record already exists: {cve_id}")
+                            else:
+                                logger.info(f"Non-CVE vulnerability: {vuln_id} - will create Finding without CVE link")
+                            
+                            # Step 2: Create Finding - IMPROVED title for non-CVE vulnerabilities
+                            if is_cve_vulnerability:
+                                finding_title = f"{lib_name} {lib_version} - {vuln_id}"
+                            else:
+                                # For non-CVE vulnerabilities, use source and summary
+                                source = vuln.get('source', 'Security')
+                                summary = vuln.get('summary', 'Vulnerability')
                                 
-                                # Check if finding already exists
-                                existing_finding = Finding.objects.filter(
-                                    asset=asset,
-                                    title__icontains=f"{lib_name} {lib_version} - {cve_id}"
-                                ).first()
+                                # Clean up summary for title (take first line or first 60 chars)
+                                if summary:
+                                    summary_clean = summary.split('\n')[0].split('http')[0].strip()
+                                    if len(summary_clean) > 60:
+                                        summary_clean = summary_clean[:57] + '...'
+                                else:
+                                    summary_clean = 'Vulnerability'
                                 
-                                if not existing_finding:
-                                    # Create finding
+                                finding_title = f"{lib_name} {lib_version} - {source} Vulnerability: {summary_clean}"
+
+                            logger.info(f"Finding title: {finding_title}")
+                            
+                            # FIXED: More specific deduplication - match exact title + asset
+                            existing_finding = Finding.objects.filter(
+                                asset=asset,
+                                title=finding_title,  # ← FIXED: Exact match, not __icontains
+                                category='CVE'
+                            ).first()
+                            
+                            if existing_finding:
+                                logger.info(f"📎 Finding already exists (ID={existing_finding.id}): {finding_title}")
+                                
+                                # Link existing finding to current scan
+                                scan_finding, sf_created = ScanFinding.objects.get_or_create(
+                                    scan=scan,
+                                    finding=existing_finding
+                                )
+                                if sf_created:
+                                    logger.info(f"✅ Linked existing finding to scan {scan.id}")
+                                else:
+                                    logger.info(f"ℹ️ Finding already linked to scan {scan.id}")
+                            else:
+                                # CREATE NEW FINDING
+                                logger.info(f"💾 Creating new finding: {finding_title}")
+                                logger.info(f"   Asset: {asset.value}")
+                                logger.info(f"   CVSS Score: {cvss_score}")
+                                logger.info(f"   Risk Level: {risk_level}")
+                                
+                                try:
+                                    # Get recommendation
+                                    recommendation_text = (
+                                        vuln.get('recommendation') or
+                                        vuln.get('remediation') or
+                                        vuln.get('details') or 
+                                        vuln.get('summary') or 
+                                        f'Update {lib_name} to a patched version'
+                                    )
+                                    
+                                    # Get evidence/description
+                                    evidence_text = (
+                                        vuln.get('summary') or
+                                        vuln.get('description') or
+                                        vuln.get('details') or
+                                        f"Vulnerable library: {lib_name} v{lib_version}"
+                                    )
+
+                                    # Add vulnerability source and references to evidence for non-CVE vulns
+                                    if not is_cve_vulnerability:
+                                        refs = vuln.get('references', [])
+                                        if refs:
+                                            evidence_text += f"\n\nReferences:\n" + "\n".join(refs[:3])
+
                                     finding = Finding.objects.create(
                                         asset=asset,
-                                        title=f"{lib_name} {lib_version} - {cve_id}",
+                                        title=finding_title,
                                         category='CVE',
-                                        nuclei_template_id='library-cve-check',
+                                        nuclei_template_id='library-vuln-check',
                                         nuclei_severity=vuln.get('severity', 'medium').lower(),
                                         cvss_score=cvss_score,
-                                        cvss_vector=cvss_vector,
+                                        cvss_vector=cvss_vector or '',
                                         risk_rating=risk_level,
                                         scoring_confidence='High',
-                                        evidence=f"Vulnerable library: {lib_name} v{lib_version}",
-                                        recommendation=vuln.get('details', f'Update {lib_name} to a patched version')[:500],
+                                        evidence=evidence_text[:1000],  # Limit to 1000 chars
+                                        recommendation=recommendation_text[:500],  # Limit to 500 chars
                                         status='open'
                                     )
                                     
+                                    logger.info(f"✅✅✅ CREATED Finding ID={finding.id}: {finding_title}")
+                                    logger.info(f"   Database ID: {finding.id}")
+                                    logger.info(f"   CVSS Score in DB: {finding.cvss_score}")
+                                    
                                     # Link finding to scan
-                                    ScanFinding.objects.create(scan=scan, finding=finding)
-                                    
-                                    # Link finding to CVE
-                                    FindingCVE.objects.create(
-                                        finding=finding,
-                                        cve=cve_record,
-                                        relevance='direct'
+                                    scan_finding = ScanFinding.objects.create(
+                                        scan=scan, 
+                                        finding=finding
                                     )
+                                    logger.info(f"✅ Linked finding to scan via ScanFinding ID={scan_finding.id}")
                                     
-                                    logger.info(f"Created finding for {cve_id}")
+                                    # Link finding to CVE (ONLY if we have a CVE record)
+                                    if cve_record:
+                                        FindingCVE.objects.create(
+                                            finding=finding,
+                                            cve=cve_record,
+                                            relevance='direct'
+                                        )
+                                        logger.info(f"✅ Linked finding to CVE {vuln_id}")
+                                    else:
+                                        logger.info(f"ℹ️ Non-CVE vulnerability - no CVE link created")
+                                    
+                                    # Verify the finding was created
+                                    verify_finding = Finding.objects.filter(id=finding.id).first()
+                                    if verify_finding:
+                                        logger.info(f"✅ VERIFICATION: Finding exists in database")
+                                        logger.info(f"   Title: {verify_finding.title}")
+                                        logger.info(f"   CVSS: {verify_finding.cvss_score}")
+                                        logger.info(f"   Category: {verify_finding.category}")
+                                    else:
+                                        logger.error(f"❌ VERIFICATION FAILED: Finding not found in database!")
+                                        
+                                except Exception as e:
+                                    logger.error(f"❌ FAILED to create finding: {e}")
+                                    import traceback
+                                    logger.error(f"Traceback:\n{traceback.format_exc()}")
+                                    # Don't raise - continue processing other vulnerabilities
+                        
+                        logger.info(f"\n{'='*80}")
+                        logger.info(f"FINISHED processing {len(vulnerabilities)} vulnerabilities for {lib_name}")
+                        logger.info(f"{'='*80}\n")
                     
                     # Store CMS info if detected
                     if detected_cms:
-                        logger.info(f"Detected CMS: {detected_cms['name']} v{detected_cms['version']}")
+                        logger.info(f"🔍 Detected CMS: {detected_cms['name']} v{detected_cms['version']}")
                         
                         # Create informational finding for CMS
                         if detected_cms['version'] not in ['Unknown', 'SaaS']:
@@ -667,9 +1581,19 @@ def execute_nuclei_scan(request):
                                     status='open'
                                 )
                                 ScanFinding.objects.create(scan=scan, finding=finding)
+                                logger.info(f"✓ Created CMS finding")
+                            else:
+                                # Link existing CMS finding to current scan
+                                ScanFinding.objects.get_or_create(
+                                    scan=scan,
+                                    finding=existing_cms_finding
+                                )
+                                logger.info(f"📎 Linked existing CMS finding")
                 
                 except Exception as e:
-                    logger.error(f"Library/CVE detection failed for {asset.value}: {e}")
+                    logger.error(f"❌ Library/CVE detection failed for {asset.value}: {e}")
+                    import traceback
+                    logger.error(f"Full traceback:\n{traceback.format_exc()}")
         
         # Mark scan as completed
         scan.status = 'completed'
@@ -677,7 +1601,7 @@ def execute_nuclei_scan(request):
         scan.duration_seconds = (scan.finished_at - scan.started_at).total_seconds()
         scan.save()
         
-        logger.info(f"Scan {scan.id} completed successfully in {scan.duration_seconds}s")
+        logger.info(f"✅ Scan {scan.id} completed in {scan.duration_seconds}s")
         
         return Response({
             'message': 'Scan completed successfully',
@@ -687,7 +1611,10 @@ def execute_nuclei_scan(request):
         })
         
     except Exception as e:
-        logger.error(f"Scan {scan.id} failed: {e}")
+        logger.error(f"❌ Scan {scan.id} failed: {e}")
+        import traceback
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        
         scan.status = 'failed'
         scan.error_message = str(e)
         scan.finished_at = timezone.now()
@@ -698,14 +1625,15 @@ def execute_nuclei_scan(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
-
 def _process_nuclei_results(scan, asset, results, templates):
     """
     Process Nuclei scan results and store in appropriate tables
     WITH DEDUPLICATION
     """
-    # Track processed findings to avoid duplicates
     processed_findings = set()
+
+    logger.info(f"Processing {len(results)} Nuclei scan results for {asset.value}")
+    logger.info(f"Full Nuclei scan results for {asset.value}: {json.dumps(results, indent=2, default=str)}")
     
     for result in results:
         template_id = result.get('template-id', '')
@@ -722,20 +1650,119 @@ def _process_nuclei_results(scan, asset, results, templates):
         
         processed_findings.add(finding_key)
         
-        # Determine check type based on template
-        if 'ssl' in template_id.lower() or 'tls' in template_id.lower():
+        # Process by category (non-exclusive - a result can belong to multiple categories)
+        template_lower = template_id.lower()
+        
+        if 'ssl' in template_lower or 'tls' in template_lower:
             _create_ssl_check(scan, asset, result)
-        elif 'dns' in template_id.lower():
+        
+        if 'dns' in template_lower:
             _create_dns_check(scan, asset, result)
-        elif 'email' in template_id.lower() or 'spf' in template_id.lower() or 'dmarc' in template_id.lower():
+        
+        if 'email' in template_lower or 'spf' in template_lower or 'dmarc' in template_lower or 'dkim' in template_lower:
             _create_email_check(scan, asset, result)
-        elif 'header' in template_id.lower():
+        
+        if 'header' in template_lower:
             _create_header_check(scan, asset, result)
-        elif 'javascript' in template_id.lower() or 'library' in template_id.lower():
+        
+        if 'javascript' in template_lower or 'library' in template_lower:
             _create_library_check(scan, asset, result)
         
-        # Also create a Finding record
+        # Always create a Finding record
         _create_finding(scan, asset, result)
+
+def _process_technology_results(scan, asset, tech_result):
+    """
+    Save detected technologies and CMS into DB
+    """
+
+    technologies = tech_result.get('technologies', [])
+    cms = tech_result.get('cms')
+
+    # ---------------- GENERAL TECHNOLOGIES ----------------
+    for tech in technologies:
+        tech_name = tech.get('name')
+        tech_version = tech.get('version', 'Unknown')
+        tech_category = tech.get('category', 'general')
+
+        TechnologyCheck.objects.get_or_create(
+            scan=scan,
+            asset=asset,
+            technology_name=tech_name,
+            version=tech_version,
+            category=tech_category
+        )
+
+    # ---------------- CMS ----------------
+    if cms:
+        TechnologyCheck.objects.get_or_create(
+            scan=scan,
+            asset=asset,
+            technology_name=cms.get('name'),
+            version=cms.get('version', 'Unknown'),
+            category='CMS'
+        )
+
+# def _process_library_detection(scan, asset, tech_result, check_cves):
+
+#     detected_libraries = tech_result.get('libraries', [])
+
+#     for lib in detected_libraries:
+
+#         lib_name = lib.get('name')
+#         lib_version = lib.get('version', 'Unknown')
+
+#         vulnerabilities = []
+#         vuln_status = 'unknown'
+#         risk_level = 'Low'
+#         recommendation = f"Manual version verification needed for {lib_name}"
+
+#         # CVE checking
+#         if check_cves and lib_version not in ['Unknown', 'unknown', 'latest']:
+
+#             try:
+#                 ecosystem = get_ecosystem_for_library(lib_name.lower())
+
+#                 cve_result = check_library_vulnerabilities(
+#                     lib_name,
+#                     lib_version,
+#                     ecosystem
+#                 )
+
+#                 vulnerabilities = cve_result.get('vulnerabilities', [])
+#                 max_cvss = cve_result.get('max_cvss_score', 0.0)
+
+#                 if vulnerabilities:
+#                     vuln_status = 'vulnerable'
+
+#                     if max_cvss >= 9:
+#                         risk_level = 'Critical'
+#                     elif max_cvss >= 7:
+#                         risk_level = 'High'
+#                     elif max_cvss >= 4:
+#                         risk_level = 'Medium'
+
+#                     recommendation = f"Update {lib_name} immediately"
+
+#                 else:
+#                     vuln_status = 'up-to-date'
+
+#             except Exception as e:
+#                 logger.error(f"CVE check failed: {e}")
+#                 vuln_status = 'check-failed'
+
+#         FrontendLibraryCheck.objects.get_or_create(
+#             scan=scan,
+#             asset=asset,
+#             library_name=lib_name,
+#             detected_version=lib_version,
+#             defaults={
+#                 'latest_version': 'Unknown',
+#                 'vulnerability_status': vuln_status,
+#                 'risk_level': risk_level,
+#                 'recommendation': recommendation
+#             }
+#         )
 
 
 def _create_ssl_check(scan, asset, result):
@@ -767,16 +1794,25 @@ def _create_ssl_check(scan, asset, result):
         logger.debug(f"Skipping duplicate SSL check: {finding_name}")
         return
     
+    classification = info.get('classification', {})
+    cvss_score = classification.get('cvss-score', 0.0)
+    try:
+        cvss_score = float(cvss_score)
+    except (ValueError, TypeError):
+        cvss_score = 0.0
+    
     SSLTLSCheck.objects.create(
         scan=scan,
         asset=asset,
         check_type=check_type,
         finding=finding_name,
         example=result.get('matched-at', ''),
-        cvss_score=info.get('classification', {}).get('cvss-score', 0.0),
+        cvss_score=cvss_score,
         risk_rating=_map_severity_to_risk(info.get('severity', 'info')),
         recommendation=info.get('remediation', '')
     )
+
+    
 
 
 def _create_dns_check(scan, asset, result):
@@ -918,7 +1954,7 @@ def _create_library_check(scan, asset, result):
 
 
 def _create_finding(scan, asset, result):
-    """Create general finding record with deduplication"""
+    """Create general finding record with deduplication - FIXED CVSS EXTRACTION"""
     info = result.get('info', {})
     title = info.get('name', '')
     template_id = result.get('template-id', '')
@@ -931,9 +1967,54 @@ def _create_finding(scan, asset, result):
     ).first()
     
     if existing:
-        # Just link existing finding to this scan
         ScanFinding.objects.get_or_create(scan=scan, finding=existing)
+        logger.debug(f"📎 Linked existing finding: {title}")
         return
+    
+    # ============ FIXED CVSS EXTRACTION ============
+    classification = info.get('classification', {})
+    
+    cvss_score = None
+    cvss_vector = None
+    
+    # Method 1: Try cvss-score field
+    if 'cvss-score' in classification:
+        try:
+            cvss_score = float(classification['cvss-score'])
+        except (ValueError, TypeError):
+            pass
+    
+    # Method 2: Try parsing cvss-metrics vector
+    if 'cvss-metrics' in classification and classification['cvss-metrics']:
+        cvss_vector = classification['cvss-metrics']
+        if cvss_score is None:
+            score_match = re.search(r'/BS:(\d+\.\d+)', cvss_vector)
+            if score_match:
+                try:
+                    cvss_score = float(score_match.group(1))
+                except (ValueError, TypeError):
+                    pass
+    
+    # Method 3: Map from severity if still None
+    if cvss_score is None:
+        severity = info.get('severity', 'info').lower()
+        severity_to_cvss = {
+            'critical': 9.5,
+            'high': 7.5,
+            'medium': 5.0,
+            'low': 3.0,
+            'info': 0.0
+        }
+        cvss_score = severity_to_cvss.get(severity, 0.0)
+        logger.warning(f"⚠️ No CVSS score found for '{title}', using severity mapping: {cvss_score}")
+    
+    # Ensure cvss_score is a float
+    try:
+        cvss_score = float(cvss_score)
+    except (ValueError, TypeError):
+        cvss_score = 0.0
+    
+    logger.info(f"💾 Creating finding: {title} (CVSS: {cvss_score})")
     
     finding = Finding.objects.create(
         asset=asset,
@@ -941,18 +2022,17 @@ def _create_finding(scan, asset, result):
         category=_determine_category(template_id),
         nuclei_template_id=template_id,
         nuclei_severity=info.get('severity', 'info'),
-        cvss_score=info.get('classification', {}).get('cvss-score'),
-        cvss_vector=info.get('classification', {}).get('cvss-metrics'),
+        cvss_score=cvss_score,  # ✅ FIXED: Now guaranteed to have valid float
+        cvss_vector=cvss_vector or '',
         risk_rating=_map_severity_to_risk(info.get('severity', 'info')),
         scoring_confidence='High',
         evidence=result.get('matched-at', ''),
-        recommendation=info.get('remediation', ''),
+        recommendation=info.get('remediation', 'No remediation provided'),
         status='open'
     )
     
-    # Link to scan
     ScanFinding.objects.create(scan=scan, finding=finding)
-
+    logger.info(f"✅ Created finding ID={finding.id} with CVSS={cvss_score}")
 
 def _map_severity_to_risk(severity):
     """Map Nuclei severity to risk rating"""
@@ -1013,4 +2093,537 @@ def dashboard_metrics(request):
         'findings_by_risk': {item['risk_rating']: item['count'] for item in findings_by_risk},
         'total_assets': Asset.objects.count(),
         'total_domains': Domain.objects.count(),
+    })
+
+@api_view(['GET'])
+def debug_scan_data(request, scan_id):
+    """
+    Debug endpoint to check scan data integrity
+    GET /api/debug/scan/{scan_id}/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    
+    # Count findings
+    scan_findings_count = ScanFinding.objects.filter(scan=scan).count()
+    unique_findings = ScanFinding.objects.filter(scan=scan).values('finding_id').distinct().count()
+    
+    # Count by category
+    findings_by_category = {}
+    scan_findings_qs = ScanFinding.objects.filter(scan=scan).select_related('finding')
+    for sf in scan_findings_qs:
+        cat = sf.finding.category
+        findings_by_category[cat] = findings_by_category.get(cat, 0) + 1
+    
+    # Check CVSS scores
+    findings_with_cvss = Finding.objects.filter(
+        id__in=ScanFinding.objects.filter(scan=scan).values('finding_id')
+    ).exclude(cvss_score__isnull=True).exclude(cvss_score=0.0).count()
+    
+    findings_without_cvss = Finding.objects.filter(
+        id__in=ScanFinding.objects.filter(scan=scan).values('finding_id')
+    ).filter(Q(cvss_score__isnull=True) | Q(cvss_score=0.0)).count()
+    
+    # Sample findings
+    sample_findings = Finding.objects.filter(
+        id__in=ScanFinding.objects.filter(scan=scan).values('finding_id')
+    ).exclude(cvss_score__isnull=True).exclude(cvss_score=0.0).order_by('-cvss_score')[:5]
+    
+    sample_findings_data = [
+        {
+            'id': f.id,
+            'title': f.title,
+            'cvss_score': f.cvss_score,
+            'category': f.category
+        }
+        for f in sample_findings
+    ]
+    
+    # Check assets
+    assets_scanned = ScanAsset.objects.filter(scan=scan).count()
+    assets_with_org = ScanAsset.objects.filter(
+        scan=scan,
+        asset__domain__owner__isnull=False
+    ).exclude(asset__domain__owner='').count()
+    
+    # Get organization names
+    org_names = []
+    for sa in ScanAsset.objects.filter(scan=scan).select_related('asset__domain'):
+        if sa.asset.domain and sa.asset.domain.owner:
+            org_names.append({
+                'asset': sa.asset.value,
+                'domain': sa.asset.domain.root_domain,
+                'organization': sa.asset.domain.owner
+            })
+    
+    return Response({
+        'scan_id': scan_id,
+        'scan_status': scan.status,
+        'scan_duration_seconds': scan.duration_seconds,
+        'total_scan_findings_records': scan_findings_count,
+        'unique_findings': unique_findings,
+        'findings_by_category': findings_by_category,
+        'cvss_statistics': {
+            'findings_with_cvss_score': findings_with_cvss,
+            'findings_without_cvss_score': findings_without_cvss,
+            'sample_findings_with_cvss': sample_findings_data
+        },
+        'assets': {
+            'total_scanned': assets_scanned,
+            'with_organization_name': assets_with_org,
+            'organization_names': org_names
+        },
+        'check_counts': {
+            'library_checks': scan.library_checks.count(),
+            'ssl_checks': scan.ssl_checks.count(),
+            'email_checks': scan.email_checks.count(),
+            'header_checks': scan.header_checks.count(),
+            'dns_checks': scan.dns_checks.count(),
+            'technology_checks': scan.technology_checks.count()
+        }
+    })
+
+
+@api_view(['GET'])
+def executive_dashboard(request):
+    """
+    Executive Summary Dashboard - Comprehensive metrics
+    GET /api/dashboard/executive/
+    
+    Returns all key metrics organized by priority tiers
+    """
+    logger.info("Generating executive dashboard...")
+    
+    # ============================================
+    # TIER 1 - CORE OVERVIEW
+    # ============================================
+    
+    # Overall Security Posture
+    total_findings = Finding.objects.count()
+    critical_findings = Finding.objects.filter(risk_rating='Critical', status='open').count()
+    high_findings = Finding.objects.filter(risk_rating='High', status='open').count()
+    medium_findings = Finding.objects.filter(risk_rating='Medium', status='open').count()
+    low_findings = Finding.objects.filter(risk_rating='Low', status='open').count()
+    
+    # Calculate overall security score (0-100)
+    # total_checks = (
+    #     FrontendLibraryCheck.objects.count() +
+    #     SSLTLSCheck.objects.count() +
+    #     EmailSecurityCheck.objects.count() +
+    #     SecurityHeaderCheck.objects.count() +
+    #     DNSSecurityCheck.objects.count()
+    # )
+    
+    # failed_checks = (
+    #     FrontendLibraryCheck.objects.filter(
+    #         Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+    #     ).count() +
+    #     SSLTLSCheck.objects.exclude(risk_rating='Low').count() +
+    #     EmailSecurityCheck.objects.filter(status='FAIL').count() +
+    #     SecurityHeaderCheck.objects.filter(status='missing').count() +
+    #     DNSSecurityCheck.objects.exclude(risk_rating='Low').count()
+    # )
+    
+    # overall_security_score = 100
+    # if total_checks > 0:
+    #     overall_security_score = round(((total_checks - failed_checks) / total_checks) * 100)
+
+    # Calculate overall security score (0-100)
+    total_checks = (
+        FrontendLibraryCheck.objects.count() +
+        SSLTLSCheck.objects.count() +
+        EmailSecurityCheck.objects.count() +
+        SecurityHeaderCheck.objects.count() +
+        DNSSecurityCheck.objects.count()
+    )
+
+    failed_checks = (
+        FrontendLibraryCheck.objects.filter(
+            Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+        ).count() +
+        SSLTLSCheck.objects.exclude(risk_rating='Low').count() +
+        EmailSecurityCheck.objects.filter(status='FAIL').count() +
+        SecurityHeaderCheck.objects.filter(status='missing').count() +
+        DNSSecurityCheck.objects.exclude(risk_rating='Low').count()
+    )
+
+    check_score = 100
+    if total_checks > 0:
+        check_score = round(((total_checks - failed_checks) / total_checks) * 100)
+
+    vuln_penalty = (3 * critical_findings) + (2 * high_findings) + (1 * medium_findings) + (0.5 * low_findings)
+    overall_security_score = max(0, check_score - min(20, vuln_penalty))
+    
+    # Key Metrics
+    total_scans = Scan.objects.count()
+    completed_scans = Scan.objects.filter(status='completed').count()
+    failed_scans = Scan.objects.filter(status='failed').count()
+    scans_this_week = Scan.objects.filter(
+        created_at__gte=timezone.now() - timedelta(days=7)
+    ).count()
+    
+    # Asset Overview
+    total_domains = Domain.objects.count()
+    total_assets = Asset.objects.count()
+    
+    # Scan Status Summary
+    pending_scans = Scan.objects.filter(status__in=['queued', 'running']).count()
+    
+    # ============================================
+    # TIER 2 - CRITICAL INSIGHTS
+    # ============================================
+    
+    # Worst Performing Owners (Top 5)
+    worst_owners = []
+    domains_with_owner = Domain.objects.exclude(owner__isnull=True).exclude(owner='')
+    
+    for domain in domains_with_owner:
+        # Get all assets for this domain
+        asset_ids = domain.assets.values_list('id', flat=True)
+        
+        # Count findings by risk for this domain's assets
+        owner_critical = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='Critical'
+        ).count()
+        
+        owner_high = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='High'
+        ).count()
+        
+        # Calculate security score for this owner
+        owner_total_checks = (
+            FrontendLibraryCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids).count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).count()
+        )
+        
+        owner_failed_checks = (
+            FrontendLibraryCheck.objects.filter(
+                asset_id__in=asset_ids
+            ).filter(
+                Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+            ).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids, status='FAIL').count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids, status='missing').count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count()
+        )
+        
+        owner_score = 100
+        if owner_total_checks > 0:
+            owner_score = round(((owner_total_checks - owner_failed_checks) / owner_total_checks) * 100)
+        
+        if owner_critical > 0 or owner_high > 0:
+            worst_owners.append({
+                'owner': domain.owner,
+                'critical_count': owner_critical,
+                'high_count': owner_high,
+                'security_score': owner_score,
+                'total_assets': len(asset_ids)
+            })
+    
+    # Sort by critical first, then high, then score
+    worst_owners.sort(key=lambda x: (-x['critical_count'], -x['high_count'], x['security_score']))
+    worst_owners = worst_owners[:5]
+    
+    # Worst Performing Assets (Top 10)
+    worst_assets = []
+    for asset in Asset.objects.all():
+        finding_count = Finding.objects.filter(asset=asset).count()
+        critical_count = Finding.objects.filter(asset=asset, risk_rating='Critical').count()
+        high_count = Finding.objects.filter(asset=asset, risk_rating='High').count()
+        
+        # Determine risk level
+        risk_level = 'Low'
+        if critical_count > 0:
+            risk_level = 'Critical'
+        elif high_count > 0:
+            risk_level = 'High'
+        elif Finding.objects.filter(asset=asset, risk_rating='Medium').exists():
+            risk_level = 'Medium'
+        
+        if finding_count > 0:
+            worst_assets.append({
+                'asset_id': asset.id,
+                'asset_value': asset.value,
+                'asset_type': asset.asset_type,
+                'finding_count': finding_count,
+                'critical_count': critical_count,
+                'high_count': high_count,
+                'risk_level': risk_level
+            })
+    
+    worst_assets.sort(key=lambda x: (-x['critical_count'], -x['high_count'], -x['finding_count']))
+    worst_assets = worst_assets[:10]
+    
+    # Most Common Vulnerabilities (Top 10)
+    vulnerability_counts = Finding.objects.filter(
+        category='CVE'
+    ).values('title', 'risk_rating').annotate(
+        frequency=Count('id')
+    ).order_by('-frequency')[:10]
+    
+    most_common_vulnerabilities = [
+        {
+            'vulnerability_name': item['title'],
+            'frequency': item['frequency'],
+            'risk_level': item['risk_rating']
+        }
+        for item in vulnerability_counts
+    ]
+    
+    # ============================================
+    # TIER 3 - DETAILED ANALYSIS
+    # ============================================
+    
+    # Most Vulnerable Libraries (Top 5)
+    library_stats = FrontendLibraryCheck.objects.values('library_name').annotate(
+        outdated_count=Count('id', filter=Q(vulnerability_status='outdated')),
+        vulnerable_count=Count('id', filter=Q(vulnerability_status='vulnerable')),
+        total_count=Count('id')
+    ).filter(
+        Q(outdated_count__gt=0) | Q(vulnerable_count__gt=0)
+    ).order_by('-vulnerable_count', '-outdated_count')[:5]
+    
+    most_vulnerable_libraries = [
+        {
+            'library_name': item['library_name'],
+            'outdated_count': item['outdated_count'],
+            'vulnerable_count': item['vulnerable_count'],
+            'total_instances': item['total_count']
+        }
+        for item in library_stats
+    ]
+    
+    # Most Commonly Missing Headers (Top 5)
+    header_stats = SecurityHeaderCheck.objects.filter(
+        status='missing'
+    ).values('header').annotate(
+        frequency=Count('id'),
+        affected_assets=Count('asset', distinct=True)
+    ).order_by('-frequency')[:5]
+    
+    most_missing_headers = [
+        {
+            'header_name': item['header'],
+            'frequency': item['frequency'],
+            'affected_asset_count': item['affected_assets']
+        }
+        for item in header_stats
+    ]
+    
+    # ============================================
+    # TIER 4 - PERFORMANCE INSIGHTS
+    # ============================================
+    
+    # Best Performing Owners (Top 5)
+    best_owners = []
+    for domain in domains_with_owner:
+        asset_ids = domain.assets.values_list('id', flat=True)
+        
+        owner_critical = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='Critical'
+        ).count()
+        
+        owner_high = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='High'
+        ).count()
+        
+        owner_total_checks = (
+            FrontendLibraryCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids).count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).count()
+        )
+        
+        owner_failed_checks = (
+            FrontendLibraryCheck.objects.filter(
+                asset_id__in=asset_ids
+            ).filter(
+                Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+            ).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids, status='FAIL').count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids, status='missing').count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count()
+        )
+        
+        owner_score = 100
+        if owner_total_checks > 0:
+            owner_score = round(((owner_total_checks - owner_failed_checks) / owner_total_checks) * 100)
+        
+        best_owners.append({
+            'owner': domain.owner,
+            'security_score': owner_score,
+            'total_assets': len(asset_ids),
+            'critical_count': owner_critical,
+            'high_count': owner_high
+        })
+    
+    # Sort by score (highest first), then by least critical/high issues
+    best_owners.sort(key=lambda x: (-x['security_score'], x['critical_count'], x['high_count']))
+    best_owners = best_owners[:5]
+    
+    # Domain Security Score Distribution
+    score_distribution = {
+        'excellent': 0,    # 81-100
+        'good': 0,         # 61-80
+        'fair': 0,         # 41-60
+        'at_risk': 0,      # 21-40
+        'critical': 0      # 0-20
+    }
+    
+    for domain in Domain.objects.all():
+        asset_ids = domain.assets.values_list('id', flat=True)
+        if not asset_ids:
+            continue
+        
+        domain_total_checks = (
+            FrontendLibraryCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids).count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).count()
+        )
+        
+        if domain_total_checks == 0:
+            continue
+        
+        domain_failed_checks = (
+            FrontendLibraryCheck.objects.filter(
+                asset_id__in=asset_ids
+            ).filter(
+                Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+            ).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids, status='FAIL').count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids, status='missing').count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count()
+        )
+        
+        domain_score = round(((domain_total_checks - domain_failed_checks) / domain_total_checks) * 100)
+        
+        if domain_score >= 81:
+            score_distribution['excellent'] += 1
+        elif domain_score >= 61:
+            score_distribution['good'] += 1
+        elif domain_score >= 41:
+            score_distribution['fair'] += 1
+        elif domain_score >= 21:
+            score_distribution['at_risk'] += 1
+        else:
+            score_distribution['critical'] += 1
+    
+    # Assets by Owner
+    assets_by_owner = []
+    for domain in domains_with_owner:
+        asset_ids = list(domain.assets.values_list('id', flat=True))
+        
+        owner_critical = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='Critical'
+        ).count()
+        
+        owner_high = Finding.objects.filter(
+            asset_id__in=asset_ids,
+            risk_rating='High'
+        ).count()
+        
+        owner_total_checks = (
+            FrontendLibraryCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids).count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids).count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).count()
+        )
+        
+        owner_failed_checks = (
+            FrontendLibraryCheck.objects.filter(
+                asset_id__in=asset_ids
+            ).filter(
+                Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
+            ).count() +
+            SSLTLSCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count() +
+            EmailSecurityCheck.objects.filter(asset_id__in=asset_ids, status='FAIL').count() +
+            SecurityHeaderCheck.objects.filter(asset_id__in=asset_ids, status='missing').count() +
+            DNSSecurityCheck.objects.filter(asset_id__in=asset_ids).exclude(risk_rating='Low').count()
+        )
+        
+        avg_score = 100
+        if owner_total_checks > 0:
+            avg_score = round(((owner_total_checks - owner_failed_checks) / owner_total_checks) * 100)
+        
+        assets_by_owner.append({
+            'owner': domain.owner,
+            'total_assets': len(asset_ids),
+            'critical_issues': owner_critical,
+            'high_issues': owner_high,
+            'avg_security_score': avg_score
+        })
+    
+    assets_by_owner.sort(key=lambda x: -x['total_assets'])
+    
+    # ============================================
+    # FINAL RESPONSE
+    # ============================================
+    
+    return Response({
+        'tier_1_core_overview': {
+            'overall_security_posture': {
+                'status': 'At Risk' if critical_findings > 0 else 'Good' if high_findings == 0 else 'Fair',
+                'security_score': overall_security_score,
+                'critical_issues': critical_findings,
+                'high_issues': high_findings,
+                'medium_issues': medium_findings,
+                'low_issues': low_findings
+            },
+            'key_metrics': {
+                'total_scans': total_scans,
+                'completed_scans': completed_scans,
+                'failed_scans': failed_scans,
+                'scans_this_week': scans_this_week
+            },
+            'asset_overview': {
+                'total_domains': total_domains,
+                'total_assets': total_assets
+            },
+            'findings_by_risk_level': {
+                'critical': critical_findings,
+                'high': high_findings,
+                'medium': medium_findings,
+                'low': low_findings,
+                'total_findings': total_findings
+            },
+            'scan_status_summary': {
+                'completed': completed_scans,
+                'failed': failed_scans,
+                'pending_in_progress': pending_scans
+            }
+        },
+        'tier_2_critical_insights': {
+            'worst_performing_owners': worst_owners,
+            'worst_performing_assets': worst_assets,
+            'most_common_vulnerabilities': most_common_vulnerabilities
+        },
+        'tier_3_detailed_analysis': {
+            'most_vulnerable_libraries': most_vulnerable_libraries,
+            'most_commonly_missing_headers': most_missing_headers
+        },
+        'tier_4_performance_insights': {
+            'best_performing_owners': best_owners,
+            'domain_security_score_distribution': {
+                'excellent_81_100': score_distribution['excellent'],
+                'good_61_80': score_distribution['good'],
+                'fair_41_60': score_distribution['fair'],
+                'at_risk_21_40': score_distribution['at_risk'],
+                'critical_0_20': score_distribution['critical']
+            },
+            'assets_by_owner': assets_by_owner
+        }
     })

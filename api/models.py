@@ -248,6 +248,8 @@ class FrontendLibraryCheck(models.Model):
         ('up-to-date', 'Up-to-date'),
         ('outdated', 'Outdated'),
         ('vulnerable', 'Vulnerable'),
+        ('unknown', 'Unknown'),              # ADD
+        ('check-failed', 'Check Failed'),    # ADD
     ]
     
     RISK_LEVEL_CHOICES = [
@@ -393,3 +395,22 @@ class DNSSecurityCheck(models.Model):
     
     def __str__(self):
         return f"{self.check_type} - {self.asset.value}"
+
+class TechnologyCheck(models.Model):
+    scan = models.ForeignKey(Scan, related_name='technology_checks', on_delete=models.CASCADE)
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE)
+
+    technology_name = models.CharField(max_length=200)
+    version = models.CharField(max_length=100, default='Unknown', blank=True, null=True)
+    category = models.CharField(max_length=100, default='general')
+
+    risk_level = models.CharField(
+        max_length=20,
+        choices=[('Low','Low'),('Medium','Medium'),('High','High')],
+        default='Low'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.technology_name} {self.version}"

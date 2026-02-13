@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from .models import TechnologyCheck
 from .models import (
     Domain, Asset, Scan, ScanAsset, Finding, ScanFinding, CVE, FindingCVE,
     FrontendLibraryCheck, SSLTLSCheck, EmailSecurityCheck, 
@@ -154,6 +155,7 @@ class ScanResultSerializer(serializers.ModelSerializer):
     email_checks = EmailSecurityCheckSerializer(many=True, read_only=True)
     header_checks = SecurityHeaderCheckSerializer(many=True, read_only=True)
     dns_checks = DNSSecurityCheckSerializer(many=True, read_only=True)
+    checks = serializers.SerializerMethodField()
     findings = serializers.SerializerMethodField()
     
     class Meta:
@@ -162,8 +164,115 @@ class ScanResultSerializer(serializers.ModelSerializer):
             'id', 'scan_type', 'status', 'started_at', 'finished_at',
             'duration_seconds', 'error_message', 'created_at',
             'library_checks', 'ssl_checks', 'email_checks',
-            'header_checks', 'dns_checks', 'findings'
+            'header_checks', 'dns_checks', 'checks', 'findings'
         ]
+
+    def _max_risk_level(self, levels):
+        risk_order = {'Low': 0, 'Medium': 1, 'High': 2, 'Critical': 3}
+        if not levels:
+            return 'Low'
+        return max(levels, key=lambda level: risk_order.get(level, 0))
+
+    def get_checks(self, obj):
+        library_checks = list(obj.library_checks.all())
+        ssl_checks = list(obj.ssl_checks.all())
+        email_checks = list(obj.email_checks.all())
+        header_checks = list(obj.header_checks.all())
+
+        library_details = [
+            {
+                'name': check.library_name,
+                'detected_version': check.detected_version,
+                'latest_version': check.latest_version,
+                'status': check.vulnerability_status,
+                'vulnerability': check.risk_level
+            }
+            for check in library_checks
+        ]
+        libraries_up_to_date = len(
+            [check for check in library_checks if check.vulnerability_status == 'up-to-date']
+        )
+        libraries_outdated = len(library_checks) - libraries_up_to_date
+
+        ssl_details = [
+            {
+                'name': check.finding or check.check_type,
+                'type': check.check_type,
+                'status': 'pass' if check.risk_rating == 'Low' else 'fail',
+                'details': check.example or check.finding or 'N/A',
+                'recommendation': check.recommendation or 'Review SSL/TLS configuration'
+            }
+            for check in ssl_checks
+        ]
+        ssl_passed = len([check for check in ssl_checks if check.risk_rating == 'Low'])
+        ssl_failed = len(ssl_checks) - ssl_passed
+        ssl_score = 100 if not ssl_checks else round(100 * (ssl_passed / len(ssl_checks)))
+
+        email_details = [
+            {
+                'name': check.check_type,
+                'type': check.check_type,
+                'status': check.status.lower(),
+                'details': check.details or 'N/A',
+                'recommendation': check.recommendation or 'Review and configure'
+            }
+            for check in email_checks
+        ]
+        email_passed = len([check for check in email_checks if check.status == 'PASS'])
+        email_failed = len(email_checks) - email_passed
+        email_score = 100 if not email_checks else round(100 * (email_passed / len(email_checks)))
+
+        missing_headers = [
+            {
+                'name': check.header,
+                'risk': check.risk_rating or 'Medium',
+                'recommendation': check.recommendation or f"Add {check.header} header"
+            }
+            for check in header_checks if check.status in ['missing', 'misconfigured']
+        ]
+        present_headers = [
+            {
+                'name': check.header,
+                'value': check.header_value or 'Configured'
+            }
+            for check in header_checks if check.status == 'present'
+        ]
+        header_passed = len(present_headers)
+        header_failed = len(missing_headers)
+        header_total = len(header_checks)
+        header_score = 100 if not header_checks else round(100 * (header_passed / header_total))
+
+        return {
+            'libraries': {
+                'upToDate': libraries_up_to_date,
+                'outdated': libraries_outdated,
+                'details': library_details
+            },
+            'ssl': {
+                'passed': ssl_passed,
+                'failed': ssl_failed,
+                'score': ssl_score,
+                'riskLevel': self._max_risk_level([check.risk_rating for check in ssl_checks]),
+                'details': ssl_details
+            },
+            'email': {
+                'passed': email_passed,
+                'failed': email_failed,
+                'score': email_score,
+                'riskLevel': self._max_risk_level([check.risk_rating for check in email_checks]),
+                'details': email_details
+            },
+            'headers': {
+                'passed': header_passed,
+                'failed': header_failed,
+                'score': header_score,
+                'riskLevel': self._max_risk_level([check.risk_rating for check in header_checks]),
+                'details': {
+                    'missing': missing_headers,
+                    'present': present_headers
+                }
+            }
+        }
     
     def get_findings(self, obj):
         """Get all findings associated with this scan"""
@@ -213,3 +322,10 @@ class ScanSummarySerializer(serializers.Serializer):
     # Headers specific
     missing_headers = serializers.IntegerField()
     present_headers = serializers.IntegerField()
+
+class TechnologyCheckSerializer(serializers.ModelSerializer):
+    asset_value = serializers.CharField(source='asset.value', read_only=True)
+
+    class Meta:
+        model = TechnologyCheck
+        fields = '__all__'

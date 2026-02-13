@@ -2,6 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from . import views
 
+
 # Create router for viewsets
 router = DefaultRouter()
 router.register(r'domains', views.DomainViewSet, basename='domain')  # ADD THIS
@@ -46,4 +47,13 @@ urlpatterns = [
     path('dashboard/metrics/', 
          views.dashboard_metrics, 
          name='dashboard-metrics'),
+
+    # Findings endpoints
+    path('scans/<int:scan_id>/findings/', views.scan_findings, name='scan_findings'),
+    path('findings/', views.all_findings, name='all_findings'),  # NEW
+    
+    # Debug endpoint
+    path('debug/scan/<int:scan_id>/', views.debug_scan_data, name='debug_scan_data'),  # NEW
+
+    path('dashboard/executive/', views.executive_dashboard, name='executive-dashboard'),
 ]
