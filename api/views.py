@@ -11,7 +11,9 @@ import logging
 import re  # ← ADDED: Import re module for regex operations
 import requests
 import warnings
-from typing import Dict, Any
+import socket
+from typing import Dict, Any, List
+from urllib.parse import urlparse
 from urllib3.exceptions import InsecureRequestWarning
 
 # Disable SSL verification warnings
@@ -40,6 +42,80 @@ from .library_detector import detect_technologies
 from .org_extractor import extract_organization_name
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_target_url(target: str) -> str:
+    """Ensure target has a scheme for HTTP probing."""
+    if target.startswith(('http://', 'https://')):
+        return target
+    return f'https://{target}'
+
+
+def _check_target_is_active(target: str) -> Dict[str, Any]:
+    """Check if a target is resolvable and reachable over HTTP(S)."""
+    target_url = _normalize_target_url(target)
+    parsed = urlparse(target_url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        return {
+            'active': False,
+            'target': target,
+            'target_url': target_url,
+            'reason': 'Invalid target format',
+        }
+
+    try:
+        socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return {
+            'active': False,
+            'target': target,
+            'target_url': target_url,
+            'reason': f'DNS resolution failed for {hostname}',
+        }
+
+    try:
+        requests.head(target_url, timeout=10, verify=False, allow_redirects=True)
+        return {
+            'active': True,
+            'target': target,
+            'target_url': target_url,
+            'reason': '',
+        }
+    except requests.exceptions.RequestException:
+        try:
+            requests.get(target_url, timeout=10, verify=False, allow_redirects=True)
+            return {
+                'active': True,
+                'target': target,
+                'target_url': target_url,
+                'reason': '',
+            }
+        except requests.exceptions.RequestException as exc:
+            return {
+                'active': False,
+                'target': target,
+                'target_url': target_url,
+                'reason': str(exc),
+            }
+
+
+def _validate_assets_are_active(assets) -> List[Dict[str, Any]]:
+    """Return a list of inactive assets with reasons."""
+    inactive_assets = []
+
+    for asset in assets:
+        check = _check_target_is_active(asset.value)
+        if not check['active']:
+            inactive_assets.append({
+                'asset_id': asset.id,
+                'target': asset.value,
+                'target_url': check['target_url'],
+                'reason': check['reason'],
+            })
+
+    return inactive_assets
 
 
 class StandardPagination(PageNumberPagination):
@@ -251,8 +327,10 @@ class ScanViewSet(viewsets.ModelViewSet):
         expanded_templates = []
         for template in templates:
             mapped = get_template_path(template)
+            if not mapped:
+                continue
             if "," in mapped:
-                expanded_templates.extend(mapped.split(","))
+                expanded_templates.extend([item for item in mapped.split(",") if item])
             else:
                 expanded_templates.append(mapped)
         templates = expanded_templates
@@ -263,6 +341,17 @@ class ScanViewSet(viewsets.ModelViewSet):
         # Get assets
         scan_assets = ScanAsset.objects.filter(scan=scan).select_related('asset')
         assets = [sa.asset for sa in scan_assets]
+
+        inactive_assets = _validate_assets_are_active(assets)
+        if inactive_assets:
+            logger.warning(f"Scan precheck failed for scan {scan.id}: {inactive_assets}")
+            return Response(
+                {
+                    'error': 'One or more targets are not active/reachable. Scan aborted.',
+                    'inactive_targets': inactive_assets,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         
         # Update status
         scan.status = 'running'
@@ -1103,10 +1192,12 @@ def execute_nuclei_scan(request):
     expanded_templates = []
     for template in templates:
         mapped = get_template_path(template)
+        if not mapped:
+            continue
 
         # Handle comma separated template paths
         if "," in mapped:
-            expanded_templates.extend(mapped.split(","))
+            expanded_templates.extend([item for item in mapped.split(",") if item])
         else:
             expanded_templates.append(mapped)
 
@@ -1129,6 +1220,17 @@ def execute_nuclei_scan(request):
         return Response(
             {'error': f'No valid assets found for IDs: {asset_ids}'},
             status=status.HTTP_400_BAD_REQUEST
+        )
+
+    inactive_assets = _validate_assets_are_active(assets)
+    if inactive_assets:
+        logger.warning(f"On-demand scan precheck failed: {inactive_assets}")
+        return Response(
+            {
+                'error': 'One or more targets are not active/reachable. Scan aborted.',
+                'inactive_targets': inactive_assets,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
     
     # Create scan record

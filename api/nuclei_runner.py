@@ -57,15 +57,25 @@ def _find_templates_dir(env: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _templates_dir_has_expected_content(templates_dir: str) -> bool:
+    """Check if templates directory contains expected nuclei template structure."""
+    expected_paths = [
+        os.path.join(templates_dir, 'ssl'),
+        os.path.join(templates_dir, 'dns'),
+        os.path.join(templates_dir, 'http'),
+    ]
+    return any(os.path.exists(path) for path in expected_paths)
+
+
 def ensure_nuclei_templates() -> Tuple[Dict[str, str], str]:
     """Ensure Nuclei templates are present and return (env, templates_dir)."""
     env = _build_nuclei_env()
 
     templates_dir = _find_templates_dir(env)
-    if templates_dir:
+    if templates_dir and _templates_dir_has_expected_content(templates_dir):
         return env, templates_dir
 
-    logger.info("Nuclei templates not found. Attempting to download/update templates...")
+    logger.info("Nuclei templates missing/incomplete. Attempting to download/update templates...")
     proc = subprocess.run(
         [NUCLEI_PATH, "-update-templates"],
         capture_output=True,
@@ -78,9 +88,9 @@ def ensure_nuclei_templates() -> Tuple[Dict[str, str], str]:
         logger.warning(f"Nuclei template update returned code {proc.returncode}: {proc.stderr}")
 
     templates_dir = _find_templates_dir(env)
-    if not templates_dir:
+    if not templates_dir or not _templates_dir_has_expected_content(templates_dir):
         error_msg = (
-            "Nuclei templates were not found after update. "
+            "Nuclei templates were not found or are incomplete after update. "
             "On Render, ensure runtime has writable storage and network egress to download templates."
         )
         logger.error(error_msg)
@@ -487,8 +497,8 @@ TEMPLATE_MAP = {
     'tls': 'ssl/',
     'dns': 'dns/',
     'email': 'dns/txt-fingerprint.yaml,dns/spf-*.yaml,dns/dmarc-*.yaml',
-    'headers': 'http/misconfiguration/missing-*.yaml,http/vulnerabilities/generic/missing-security-headers.yaml',
-    'security-headers': 'http/misconfiguration/missing-*.yaml',
+    'headers': '',
+    'security-headers': '',
     'cve': 'cves/',
     'misconfig': 'http/misconfiguration/',
     'misconfiguration': 'http/misconfiguration/',
@@ -508,7 +518,8 @@ def get_template_path(template_name: str) -> str:
     Returns:
         str: Nuclei template path
     """
-    return TEMPLATE_MAP.get(template_name.lower(), template_name)
+    mapped = TEMPLATE_MAP.get(template_name.lower(), template_name)
+    return mapped if mapped else ''
 
 
 # Example usage and testing
