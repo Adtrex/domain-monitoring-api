@@ -9,6 +9,14 @@ from datetime import timedelta
 import json
 import logging
 import re  # ← ADDED: Import re module for regex operations
+import requests
+import warnings
+from typing import Dict, Any
+from urllib3.exceptions import InsecureRequestWarning
+
+# Disable SSL verification warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+warnings.simplefilter('ignore', InsecureRequestWarning)
 from .models import TechnologyCheck
 from .serializers import TechnologyCheckSerializer
 
@@ -306,6 +314,25 @@ class ScanViewSet(viewsets.ModelViewSet):
                     logger.info(f"✓ Nuclei scan completed: {len(results)} results")
                 except Exception as e:
                     logger.error(f"❌ Nuclei scan failed: {e}")
+                
+                # 2.5. Check security headers directly via HTTP
+                logger.info(f"🔍 === SECURITY HEADERS CHECK STARTED ===")
+                try:
+                    asset_url = asset.value
+                    if not asset_url.startswith(('http://', 'https://')):
+                        asset_url = f'https://{asset_url}'
+                        logger.info(f"Added protocol: {asset_url}")
+                    
+                    headers_findings = check_security_headers(asset_url)
+                    _process_header_checks(scan, asset, headers_findings)
+                    
+                    missing_count = sum(1 for f in headers_findings.values() if f['status'] == 'missing')
+                    present_count = sum(1 for f in headers_findings.values() if f['status'] == 'present')
+                    logger.info(f"✓ Security headers check completed: {present_count} present, {missing_count} missing")
+                except Exception as e:
+                    logger.error(f"❌ Security headers check failed: {e}")
+                    import traceback
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
                 
                 # 3. Check for libraries and CVEs
                 if check_libraries:
@@ -1161,6 +1188,25 @@ def execute_nuclei_scan(request):
             except Exception as e:
                 logger.error(f"❌ Nuclei scan failed: {e}")
             
+            # 2.5. Check security headers directly via HTTP
+            logger.info(f"🔍 === SECURITY HEADERS CHECK STARTED ===")
+            try:
+                asset_url = asset.value
+                if not asset_url.startswith(('http://', 'https://')):
+                    asset_url = f'https://{asset_url}'
+                    logger.info(f"Added protocol: {asset_url}")
+                
+                headers_findings = check_security_headers(asset_url)
+                _process_header_checks(scan, asset, headers_findings)
+                
+                missing_count = sum(1 for f in headers_findings.values() if f['status'] == 'missing')
+                present_count = sum(1 for f in headers_findings.values() if f['status'] == 'present')
+                logger.info(f"✓ Security headers check completed: {present_count} present, {missing_count} missing")
+            except Exception as e:
+                logger.error(f"❌ Security headers check failed: {e}")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+            
             # 3. Check for libraries and CVEs
             if check_libraries:
                 logger.info(f"🔍 === LIBRARY DETECTION STARTED ===")
@@ -1895,8 +1941,146 @@ def _create_email_check(scan, asset, result):
     )
 
 
+def check_security_headers(target_url: str) -> Dict[str, Dict[str, str]]:
+    """
+    Directly check security headers on a target URL without Nuclei.
+    
+    Args:
+        target_url (str): Target URL to check
+    
+    Returns:
+        Dict: Security headers findings with status and value
+    """
+    # Security headers to check with risk ratings and recommendations
+    SECURITY_HEADERS = {
+        'Strict-Transport-Security': {
+            'risk_rating': 'High',
+            'recommendation': 'Enable HSTS to enforce HTTPS. Set "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload"',
+            'cvss_score': 7.5
+        },
+        'Content-Security-Policy': {
+            'risk_rating': 'High',
+            'recommendation': 'Implement Content-Security-Policy to prevent XSS and injection attacks.',
+            'cvss_score': 6.1
+        },
+        'X-Frame-Options': {
+            'risk_rating': 'Medium',
+            'recommendation': 'Set "X-Frame-Options: DENY" to prevent clickjacking attacks.',
+            'cvss_score': 5.3
+        },
+        'X-Content-Type-Options': {
+            'risk_rating': 'Medium',
+            'recommendation': 'Set "X-Content-Type-Options: nosniff" to prevent MIME type sniffing.',
+            'cvss_score': 5.3
+        },
+        'Referrer-Policy': {
+            'risk_rating': 'Low',
+            'recommendation': 'Set "Referrer-Policy: strict-origin-when-cross-origin" to control referrer information.',
+            'cvss_score': 3.7
+        },
+        'Permissions-Policy': {
+            'risk_rating': 'Low',
+            'recommendation': 'Implement Permissions-Policy to restrict browser features and APIs.',
+            'cvss_score': 3.7
+        },
+        'X-XSS-Protection': {
+            'risk_rating': 'Low',
+            'recommendation': 'Set "X-XSS-Protection: 1; mode=block" for legacy browser protection.',
+            'cvss_score': 3.7
+        }
+    }
+    
+    findings = {}
+    
+    try:
+        # Ensure URL has protocol
+        if not target_url.startswith(('http://', 'https://')):
+            target_url = f'https://{target_url}'
+        
+        logger.info(f"[HEADER_CHECK] Checking security headers for {target_url}")
+        
+        # Make HEAD request first (faster), fall back to GET if needed
+        try:
+            response = requests.head(target_url, timeout=10, verify=False, allow_redirects=True)
+        except:
+            response = requests.get(target_url, timeout=10, verify=False, allow_redirects=True)
+        
+        response_headers = response.headers
+        
+        # Check each security header
+        for header_name, header_info in SECURITY_HEADERS.items():
+            header_value = response_headers.get(header_name, '')
+            
+            if header_value:
+                status_val = 'present'
+                logger.info(f"  ✓ {header_name}: PRESENT")
+            else:
+                status_val = 'missing'
+                logger.info(f"  ✗ {header_name}: MISSING")
+            
+            findings[header_name] = {
+                'status': status_val,
+                'value': header_value,
+                'risk_rating': header_info['risk_rating'],
+                'cvss_score': header_info['cvss_score'],
+                'recommendation': header_info['recommendation']
+            }
+        
+        logger.info(f"[HEADER_CHECK] Completed for {target_url}")
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[HEADER_CHECK] Failed to connect to {target_url}: {e}")
+        # Return all headers as missing if we can't reach the target
+        for header_name, header_info in SECURITY_HEADERS.items():
+            findings[header_name] = {
+                'status': 'missing',
+                'value': '',
+                'risk_rating': header_info['risk_rating'],
+                'cvss_score': header_info['cvss_score'],
+                'recommendation': header_info['recommendation']
+            }
+    except Exception as e:
+        logger.error(f"[HEADER_CHECK] Unexpected error for {target_url}: {e}")
+    
+    return findings
+
+
+def _process_header_checks(scan, asset, headers_findings: Dict[str, Dict[str, str]]):
+    """
+    Process security header findings and create SecurityHeaderCheck records.
+    
+    Args:
+        scan: Scan object
+        asset: Asset object
+        headers_findings: Dict of header findings from check_security_headers()
+    """
+    for header_name, finding in headers_findings.items():
+        # Check for duplicate
+        existing = SecurityHeaderCheck.objects.filter(
+            scan=scan,
+            asset=asset,
+            header=header_name
+        ).first()
+        
+        if existing:
+            logger.debug(f"Skipping duplicate header check: {header_name}")
+            continue
+        
+        SecurityHeaderCheck.objects.create(
+            scan=scan,
+            asset=asset,
+            header=header_name,
+            status=finding['status'],
+            cvss_score=finding['cvss_score'],
+            risk_rating=finding['risk_rating'],
+            recommendation=finding['recommendation'],
+            header_value=finding['value']
+        )
+        logger.info(f"Created header check: {header_name} - {finding['status']}")
+
+
 def _create_header_check(scan, asset, result):
-    """Create security header check record with deduplication"""
+    """Create security header check record with deduplication (legacy Nuclei-based)"""
     info = result.get('info', {})
     header_name = result.get('matcher-name', '') or info.get('name', '')
     
