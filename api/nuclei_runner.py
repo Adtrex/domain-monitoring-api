@@ -13,7 +13,7 @@ import urllib.request
 import zipfile
 import stat
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,80 @@ IS_WINDOWS = platform.system() == "Windows"
 NUCLEI_VERSION = "v3.7.0"
 NUCLEI_ZIP_NAME = f"nuclei_3.7.0_{'windows_amd64' if IS_WINDOWS else 'linux_amd64'}.zip"
 NUCLEI_PATH = os.path.join(BIN_DIR, "nuclei.exe" if IS_WINDOWS else "nuclei")
+NUCLEI_HOME = os.path.join(BIN_DIR, ".nuclei-home")
+
+
+def _build_nuclei_env() -> Dict[str, str]:
+    """Build environment vars so Nuclei always uses writable runtime paths."""
+    os.makedirs(NUCLEI_HOME, exist_ok=True)
+
+    env = os.environ.copy()
+    env['HOME'] = NUCLEI_HOME
+    env['XDG_CONFIG_HOME'] = NUCLEI_HOME
+    env['XDG_CACHE_HOME'] = NUCLEI_HOME
+
+    if IS_WINDOWS:
+        env['USERPROFILE'] = NUCLEI_HOME
+
+    return env
+
+
+def _find_templates_dir(env: Dict[str, str]) -> Optional[str]:
+    """Locate nuclei-templates directory across common runtime locations."""
+    candidates = [
+        os.path.join(env.get('HOME', ''), 'nuclei-templates'),
+        os.path.join(BIN_DIR, 'nuclei-templates'),
+        os.path.join(os.getcwd(), 'nuclei-templates'),
+    ]
+
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def ensure_nuclei_templates() -> Tuple[Dict[str, str], str]:
+    """Ensure Nuclei templates are present and return (env, templates_dir)."""
+    env = _build_nuclei_env()
+
+    templates_dir = _find_templates_dir(env)
+    if templates_dir:
+        return env, templates_dir
+
+    logger.info("Nuclei templates not found. Attempting to download/update templates...")
+    proc = subprocess.run(
+        [NUCLEI_PATH, "-update-templates"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    if proc.returncode != 0:
+        logger.warning(f"Nuclei template update returned code {proc.returncode}: {proc.stderr}")
+
+    templates_dir = _find_templates_dir(env)
+    if not templates_dir:
+        error_msg = (
+            "Nuclei templates were not found after update. "
+            "On Render, ensure runtime has writable storage and network egress to download templates."
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    logger.info(f"Using Nuclei templates directory: {templates_dir}")
+    return env, templates_dir
+
+
+def resolve_template_path(template: str, templates_dir: str) -> str:
+    """Resolve relative Nuclei template paths against detected templates dir."""
+    if not template:
+        return template
+
+    if os.path.isabs(template) or os.path.exists(template):
+        return template
+
+    return os.path.join(templates_dir, template)
 
 
 def download_nuclei():
@@ -75,6 +149,7 @@ def run_nuclei_scan(target: str, templates: List[str] = None) -> List[Dict[str, 
         5
     """
     download_nuclei()
+    nuclei_env, templates_dir = ensure_nuclei_templates()
     templates = templates or ["ssl"]
     results = []
 
@@ -87,10 +162,17 @@ def run_nuclei_scan(target: str, templates: List[str] = None) -> List[Dict[str, 
     print(f"[INFO] Scanning {target} with templates: {templates}")
 
     for template in templates:
-        command = [NUCLEI_PATH, "-u", target, "-t", template, "-jsonl"]
+        resolved_template = resolve_template_path(template, templates_dir)
+        command = [NUCLEI_PATH, "-u", target, "-t", resolved_template, "-jsonl"]
         
         try:
-            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=nuclei_env,
+            )
 
             # Parse JSON lines output
             for line in proc.stdout.splitlines():
@@ -110,7 +192,7 @@ def run_nuclei_scan(target: str, templates: List[str] = None) -> List[Dict[str, 
 
             # Log stderr if present
             if proc.stderr:
-                logger.warning(f"Nuclei stderr for template '{template}': {proc.stderr}")
+                logger.warning(f"Nuclei stderr for template '{template}' ({resolved_template}): {proc.stderr}")
 
         except subprocess.CalledProcessError as e:
             logger.error(f"Scan error for template '{template}': {e}")
