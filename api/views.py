@@ -345,9 +345,19 @@ class ScanViewSet(viewsets.ModelViewSet):
         inactive_assets = _validate_assets_are_active(assets)
         if inactive_assets:
             logger.warning(f"Scan precheck failed for scan {scan.id}: {inactive_assets}")
+            scan.status = 'failed'
+            scan.error_message = 'One or more targets are not active/reachable. Scan aborted.'
+            scan.finished_at = timezone.now()
+            if scan.started_at:
+                scan.duration_seconds = int((scan.finished_at - scan.started_at).total_seconds())
+            else:
+                scan.duration_seconds = 0
+            scan.save()
             return Response(
                 {
                     'error': 'One or more targets are not active/reachable. Scan aborted.',
+                    'scan_id': scan.id,
+                    'status': 'failed',
                     'inactive_targets': inactive_assets,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -853,6 +863,11 @@ class ScanViewSet(viewsets.ModelViewSet):
         except Exception as e:
             scan.status = 'failed'
             scan.error_message = str(e)
+            scan.finished_at = timezone.now()
+            if scan.started_at:
+                scan.duration_seconds = int((scan.finished_at - scan.started_at).total_seconds())
+            else:
+                scan.duration_seconds = 0
             scan.save()
             return Response({'error': str(e)}, status=500)
 
