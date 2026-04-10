@@ -3,9 +3,11 @@ from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.shortcuts import get_object_or_404
+from django.http import HttpResponse
 from django.db.models import Count, Q
 from django.utils import timezone
 from datetime import timedelta
+import csv
 import json
 import logging
 import re  # ← ADDED: Import re module for regex operations
@@ -37,11 +39,42 @@ from .serializers import (
 
 # Import detection and scanning modules
 from .nuclei_runner import run_nuclei_scan, get_template_path
-from .cve_checker import check_library_vulnerabilities, get_ecosystem_for_library
+from .cve_checker import (
+    check_library_vulnerabilities,
+    fetch_latest_library_version,
+    get_ecosystem_for_library,
+    supports_latest_version_lookup,
+    version_compare,
+)
 from .library_detector import detect_technologies
 from .org_extractor import extract_organization_name
+from .report_style_config import (
+    generate_docx_report,
+    generate_pdf_report,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _augment_library_detections_with_analytics(tech_result, detected_libraries):
+    """Promote selected analytics detections into library entries for library checks."""
+    libraries = list(detected_libraries or [])
+    seen_names = {(item.get('name') or '').strip().lower() for item in libraries}
+
+    for analytics_item in tech_result.get('analytics', []) or []:
+        analytics_name = (analytics_item.get('name') or '').strip().lower()
+        if analytics_name == 'cloudflare beacon' and 'cloudflare beacon' not in seen_names:
+            libraries.append(
+                {
+                    'name': 'Cloudflare Beacon',
+                    'version': analytics_item.get('version', 'Unknown') or 'Unknown',
+                    'source': 'analytics_fallback',
+                    'confidence': analytics_item.get('confidence', 'medium'),
+                }
+            )
+            seen_names.add('cloudflare beacon')
+
+    return libraries
 
 
 def _normalize_target_url(target: str) -> str:
@@ -307,6 +340,283 @@ class ScanViewSet(viewsets.ModelViewSet):
         check = scan.email_checks.filter(check_type=check_type).first()
         return check.status if check else 'NOT_CHECKED'
 
+    def _build_scan_report_payload(self, scan):
+        """Build normalized report payload for export/download."""
+        scan_assets = ScanAsset.objects.filter(scan=scan).select_related('asset', 'asset__domain')
+        findings_qs = ScanFinding.objects.filter(
+            scan=scan
+        ).select_related(
+            'finding', 'finding__asset', 'finding__asset__domain'
+        ).prefetch_related(
+            'finding__finding_cves__cve'
+        )
+
+        assets = [
+            {
+                'asset_id': item.asset.id,
+                'asset_type': item.asset.asset_type,
+                'value': item.asset.value,
+                'domain': item.asset.domain.root_domain if item.asset.domain else None,
+            }
+            for item in scan_assets
+        ]
+
+        library_checks = [
+            {
+                'name': item.library_name,
+                'detected_version': item.detected_version,
+                'latest_version': item.latest_version,
+                'status': item.vulnerability_status,
+                'risk_rating': item.risk_level,
+                'asset': item.asset.value if item.asset else None,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+            }
+            for item in scan.library_checks.select_related('asset').all().order_by('library_name', 'id')
+        ]
+        technology_checks = [
+            {
+                'name': item.technology_name,
+                'version': item.version,
+                'latest_version': item.latest_version,
+                'category': item.category,
+                'risk_rating': item.risk_level,
+                'asset': item.asset.value if item.asset else None,
+                'checked_at': item.created_at,
+            }
+            for item in scan.technology_checks.select_related('asset').all().order_by('category', 'technology_name', 'id')
+        ]
+        ssl_checks = [
+            {
+                'name': item.check_type,
+                'status': item.finding,
+                'risk_rating': item.risk_rating,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'details': item.example,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+            }
+            for item in scan.ssl_checks.select_related('asset').all().order_by('check_type', 'id')
+        ]
+        email_checks = [
+            {
+                'name': item.check_type,
+                'status': item.status,
+                'risk_rating': item.risk_rating,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'details': item.details,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+            }
+            for item in scan.email_checks.select_related('asset').all().order_by('check_type', 'id')
+        ]
+        header_checks = [
+            {
+                'name': item.header,
+                'status': item.status,
+                'risk_rating': item.risk_rating,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'details': item.header_value,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+            }
+            for item in scan.header_checks.select_related('asset').all().order_by('header', 'id')
+        ]
+        dns_checks = [
+            {
+                'name': item.check_type,
+                'status': item.finding,
+                'risk_rating': item.risk_rating,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'details': item.example,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+            }
+            for item in scan.dns_checks.select_related('asset').all().order_by('check_type', 'id')
+        ]
+
+        findings = []
+        for item in findings_qs:
+            finding = item.finding
+            cve_ids = [
+                link.cve.cve_id
+                for link in finding.finding_cves.all()
+                if link.cve_id
+            ]
+
+            findings.append(
+                {
+                    'id': finding.id,
+                    'title': finding.title,
+                    'category': finding.category,
+                    'risk_rating': finding.risk_rating,
+                    'status': finding.status,
+                    'cvss_score': finding.cvss_score,
+                    'nuclei_template_id': finding.nuclei_template_id,
+                    'asset': finding.asset.value if finding.asset else None,
+                    'domain': finding.asset.domain.root_domain if finding.asset and finding.asset.domain else None,
+                    'recommendation': finding.recommendation,
+                    'first_seen': finding.first_seen,
+                    'last_seen': finding.last_seen,
+                    'cve_ids': cve_ids,
+                }
+            )
+
+        summary = {
+            'scan_id': scan.id,
+            'scan_type': scan.scan_type,
+            'status': scan.status,
+            'started_at': scan.started_at,
+            'finished_at': scan.finished_at,
+            'duration_seconds': scan.duration_seconds,
+            'total_assets_scanned': len(assets),
+            'total_findings': len(findings),
+            'critical_findings': len([f for f in findings if f['risk_rating'] == 'Critical']),
+            'high_findings': len([f for f in findings if f['risk_rating'] == 'High']),
+            'medium_findings': len([f for f in findings if f['risk_rating'] == 'Medium']),
+            'low_findings': len([f for f in findings if f['risk_rating'] == 'Low']),
+            'library_checks_count': scan.library_checks.count(),
+            'ssl_checks_count': scan.ssl_checks.count(),
+            'email_checks_count': scan.email_checks.count(),
+            'header_checks_count': scan.header_checks.count(),
+            'dns_checks_count': scan.dns_checks.count(),
+            'technology_checks_count': scan.technology_checks.count(),
+        }
+
+        return {
+            'generated_at': timezone.now(),
+            'summary': summary,
+            'assets': assets,
+            'findings': findings,
+            'checks': {
+                'libraries': library_checks,
+                'technologies': technology_checks,
+                'ssl': ssl_checks,
+                'email': email_checks,
+                'headers': header_checks,
+                'dns': dns_checks,
+            },
+        }
+
+    def _generate_pdf_report(self, payload):
+        return generate_pdf_report(payload)
+
+    def _generate_docx_report(self, payload):
+        return generate_docx_report(payload)
+
+    @action(detail=True, methods=['get'], url_path='report/download')
+    def download_report(self, request, pk=None):
+        """
+        Download generated report for a scan.
+        GET /api/scans/{id}/report/download/?format=json|csv|pdf|docx
+        """
+        scan = self.get_object()
+        report_format = request.GET.get('format', 'json').lower()
+
+        if report_format not in {'json', 'csv', 'pdf', 'docx'}:
+            return Response(
+                {'error': "Invalid format. Use 'json', 'csv', 'pdf', or 'docx'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payload = self._build_scan_report_payload(scan)
+        timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+
+        if report_format == 'json':
+            response = HttpResponse(
+                json.dumps(payload, default=str, indent=2),
+                content_type='application/json',
+            )
+            response['Content-Disposition'] = (
+                f'attachment; filename="scan_{scan.id}_report_{timestamp}.json"'
+            )
+            return response
+
+        if report_format == 'pdf':
+            content, error = self._generate_pdf_report(payload)
+            if error:
+                return Response({'error': error}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            response = HttpResponse(content, content_type='application/pdf')
+            response['Content-Disposition'] = (
+                f'attachment; filename="scan_{scan.id}_report_{timestamp}.pdf"'
+            )
+            return response
+
+        if report_format == 'docx':
+            content, error = self._generate_docx_report(payload)
+            if error:
+                return Response({'error': error}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            response = HttpResponse(
+                content,
+                content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            )
+            response['Content-Disposition'] = (
+                f'attachment; filename="scan_{scan.id}_report_{timestamp}.docx"'
+            )
+            return response
+
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = (
+            f'attachment; filename="scan_{scan.id}_report_{timestamp}.csv"'
+        )
+
+        writer = csv.writer(response)
+
+        writer.writerow(['scan_id', payload['summary']['scan_id']])
+        writer.writerow(['scan_type', payload['summary']['scan_type']])
+        writer.writerow(['status', payload['summary']['status']])
+        writer.writerow(['started_at', payload['summary']['started_at']])
+        writer.writerow(['finished_at', payload['summary']['finished_at']])
+        writer.writerow(['duration_seconds', payload['summary']['duration_seconds']])
+        writer.writerow(['total_assets_scanned', payload['summary']['total_assets_scanned']])
+        writer.writerow(['total_findings', payload['summary']['total_findings']])
+        writer.writerow(['critical_findings', payload['summary']['critical_findings']])
+        writer.writerow(['high_findings', payload['summary']['high_findings']])
+        writer.writerow(['medium_findings', payload['summary']['medium_findings']])
+        writer.writerow(['low_findings', payload['summary']['low_findings']])
+        writer.writerow([])
+
+        writer.writerow([
+            'finding_id',
+            'title',
+            'category',
+            'risk_rating',
+            'status',
+            'cvss_score',
+            'nuclei_template_id',
+            'asset',
+            'domain',
+            'cve_ids',
+            'recommendation',
+            'first_seen',
+            'last_seen',
+        ])
+
+        for finding in payload['findings']:
+            writer.writerow([
+                finding['id'],
+                finding['title'],
+                finding['category'],
+                finding['risk_rating'],
+                finding['status'],
+                finding['cvss_score'],
+                finding['nuclei_template_id'],
+                finding['asset'],
+                finding['domain'],
+                ';'.join(finding['cve_ids']),
+                finding['recommendation'],
+                finding['first_seen'],
+                finding['last_seen'],
+            ])
+
+        return response
+
     # @action(detail=True, methods=['post'])
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
@@ -409,10 +719,13 @@ class ScanViewSet(viewsets.ModelViewSet):
                 logger.info(f"Running Nuclei scan on {asset.value}")
                 try:
                     results = run_nuclei_scan(asset.value, templates=templates)
-                    _process_nuclei_results(scan, asset, results, templates)
-                    logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+                    if results:
+                        _process_nuclei_results(scan, asset, results, templates)
+                        logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+                    else:
+                        logger.info(f"ℹ️ Nuclei scan skipped or returned no results (templates may be unavailable on Windows)")
                 except Exception as e:
-                    logger.error(f"❌ Nuclei scan failed: {e}")
+                    logger.warning(f"⚠️ Nuclei scan failed: {e}. Continuing with other checks...")
                 
                 # 2.5. Check security headers directly via HTTP
                 logger.info(f"🔍 === SECURITY HEADERS CHECK STARTED ===")
@@ -451,6 +764,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                         _process_technology_results(scan, asset, tech_result)
                         
                         detected_libraries = tech_result.get('libraries', [])
+                        detected_libraries = _augment_library_detections_with_analytics(tech_result, detected_libraries)
                         detected_cms = tech_result.get('cms')
                         
                         logger.info(f"✓ Detected {len(detected_libraries)} libraries")
@@ -467,6 +781,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                             lib_name = lib.get('name')
                             lib_version = lib.get('version', 'Unknown')  # Default to 'Unknown'
                             lib_source = lib.get('source', 'unknown')
+                            latest_version = 'Unknown'
                             
                             logger.info(f"\n--- Processing: {lib_name}@{lib_version} (source: {lib_source}) ---")
                             
@@ -483,6 +798,15 @@ class ScanViewSet(viewsets.ModelViewSet):
                                 lib_version.strip() != '' and
                                 lib_version.lower() not in ['unknown', 'latest', 'saas', 'n/a']
                             )
+
+                            try:
+                                ecosystem = get_ecosystem_for_library(lib_name)
+                                resolved_latest_version = fetch_latest_library_version(lib_name, ecosystem)
+                                if resolved_latest_version:
+                                    latest_version = resolved_latest_version
+                                    logger.info(f"📦 Latest registry version for {lib_name}: {latest_version}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Latest version lookup failed for {lib_name}: {e}")
                             
                             if can_check_cve and check_cves:
                                 logger.info(f"🔍 Checking CVEs for {lib_name}@{lib_version}")
@@ -533,9 +857,14 @@ class ScanViewSet(viewsets.ModelViewSet):
                                             cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
                                             logger.info(f"  {i}. {cve_id}: CVSS {vuln.get('cvss_score', 0.0)}")
                                     else:
-                                        vuln_status = 'up-to-date'
-                                        recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
-                                        logger.info(f"✓ No CVEs found")
+                                        if latest_version != 'Unknown' and version_compare(lib_version, latest_version) < 0:
+                                            vuln_status = 'outdated'
+                                            recommendation = f"Update {lib_name} from {lib_version} to {latest_version}"
+                                            logger.info(f"⚠️ No CVEs found, but {lib_name} is outdated ({lib_version} < {latest_version})")
+                                        else:
+                                            vuln_status = 'up-to-date'
+                                            recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
+                                            logger.info(f"✓ No CVEs found")
                                         
                                 except Exception as e:
                                     logger.error(f"❌ CVE check failed for {lib_name}: {e}")
@@ -557,13 +886,30 @@ class ScanViewSet(viewsets.ModelViewSet):
                                 library_name=lib_name,
                                 detected_version=lib_version,
                                 defaults={
-                                    'latest_version': 'Unknown',
+                                    'latest_version': latest_version,
                                     'vulnerability_status': vuln_status,
                                     'risk_level': risk_level,
                                     'source_urls': [lib.get('source_url', asset_url)],
                                     'recommendation': recommendation
                                 }
                             )
+
+                            if not created:
+                                updates = []
+                                if library_check.latest_version != latest_version:
+                                    library_check.latest_version = latest_version
+                                    updates.append('latest_version')
+                                if library_check.vulnerability_status != vuln_status:
+                                    library_check.vulnerability_status = vuln_status
+                                    updates.append('vulnerability_status')
+                                if library_check.risk_level != risk_level:
+                                    library_check.risk_level = risk_level
+                                    updates.append('risk_level')
+                                if library_check.recommendation != recommendation:
+                                    library_check.recommendation = recommendation
+                                    updates.append('recommendation')
+                                if updates:
+                                    library_check.save(update_fields=updates)
                             
                             if created:
                                 logger.info(f"✓✓✓ SAVED to DB: FrontendLibraryCheck id={library_check.id}")
@@ -979,6 +1325,498 @@ def scan_header_checks(request, scan_id):
     })
 
 
+def _score_to_grade(score: int) -> str:
+    """Convert numeric score to simple A-F grade."""
+    if score >= 90:
+        return 'A'
+    if score >= 80:
+        return 'B'
+    if score >= 70:
+        return 'C'
+    if score >= 60:
+        return 'D'
+    return 'F'
+
+
+_SEVERITY_WEIGHT = {
+    'Critical': 10,
+    'High': 7,
+    'Medium': 4,
+    'Low': 2,
+}
+
+
+def _normalize_risk(risk_value, fallback='Medium'):
+    risk = (risk_value or fallback).strip().title() if isinstance(risk_value, str) else fallback
+    return risk if risk in _SEVERITY_WEIGHT else fallback
+
+
+def _empty_severity_counts():
+    return {
+        'critical': 0,
+        'high': 0,
+        'medium': 0,
+        'low': 0,
+    }
+
+
+def _add_severity_count(container, risk):
+    key = _normalize_risk(risk).lower()
+    if key in container:
+        container[key] += 1
+
+
+def _compute_grade_score(issue_points, max_points):
+    score = int(round(100 * (1 - (issue_points / max_points)))) if max_points else 0
+    score = max(0, min(score, 100))
+    impact = round((issue_points / max_points) * 100, 1) if max_points else 0.0
+    return score, impact, _score_to_grade(score)
+
+
+def _build_header_scorecard_data(scan_id, checks):
+    if not checks:
+        return {
+            'scan_id': scan_id,
+            'factor': 'Security Headers',
+            'grade': 'N/A',
+            'score': 0,
+            'impact': 0.0,
+            'summary': {
+                'total_headers': 0,
+                'passed': 0,
+                'failed': 0,
+                'missing': 0,
+                'misconfigured': 0,
+                'present': 0,
+            },
+            'issues_by_severity': _empty_severity_counts(),
+            'findings': [],
+        }
+
+    findings = []
+    issue_points = 0
+    max_points = 0
+    missing = 0
+    misconfigured = 0
+    present = 0
+    severity_counts = _empty_severity_counts()
+
+    for item in checks:
+        risk = _normalize_risk(item.risk_rating)
+        weight = _SEVERITY_WEIGHT.get(risk, 4)
+        max_points += weight
+
+        is_issue = item.status in {'missing', 'misconfigured'}
+        if is_issue:
+            issue_points += weight
+            if item.status == 'missing':
+                missing += 1
+            if item.status == 'misconfigured':
+                misconfigured += 1
+            _add_severity_count(severity_counts, risk)
+        elif item.status == 'present':
+            present += 1
+
+        findings.append(
+            {
+                'header': item.header,
+                'status': item.status,
+                'risk_rating': risk,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'recommendation': item.recommendation,
+                'header_value': item.header_value,
+                'checked_at': item.checked_at,
+                'is_issue': is_issue,
+            }
+        )
+
+    score, impact, grade = _compute_grade_score(issue_points, max_points)
+    return {
+        'scan_id': scan_id,
+        'factor': 'Security Headers',
+        'grade': grade,
+        'score': score,
+        'impact': impact,
+        'summary': {
+            'total_headers': len(checks),
+            'passed': present,
+            'failed': missing + misconfigured,
+            'missing': missing,
+            'misconfigured': misconfigured,
+            'present': present,
+        },
+        'issues_by_severity': severity_counts,
+        'findings': findings,
+    }
+
+
+def _build_ssl_scorecard_data(scan_id, checks):
+    if not checks:
+        return {
+            'scan_id': scan_id,
+            'factor': 'SSL/TLS',
+            'grade': 'N/A',
+            'score': 0,
+            'impact': 0.0,
+            'summary': {'total_checks': 0, 'passed': 0, 'failed': 0},
+            'issues_by_severity': _empty_severity_counts(),
+            'findings': [],
+        }
+
+    severity_counts = _empty_severity_counts()
+    findings = []
+    issue_points = 0
+    max_points = 0
+    passed = 0
+    failed = 0
+
+    for item in checks:
+        risk = _normalize_risk(item.risk_rating)
+        weight = _SEVERITY_WEIGHT.get(risk, 4)
+        max_points += weight
+        cvss = float(item.cvss_score) if item.cvss_score is not None else 0.0
+        is_issue = not (risk == 'Low' and cvss <= 0.0)
+        if is_issue:
+            failed += 1
+            issue_points += weight
+            _add_severity_count(severity_counts, risk)
+        else:
+            passed += 1
+        findings.append(
+            {
+                'check_type': item.check_type,
+                'finding': item.finding,
+                'status': 'issue' if is_issue else 'pass',
+                'risk_rating': risk,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+                'is_issue': is_issue,
+            }
+        )
+
+    score, impact, grade = _compute_grade_score(issue_points, max_points)
+    return {
+        'scan_id': scan_id,
+        'factor': 'SSL/TLS',
+        'grade': grade,
+        'score': score,
+        'impact': impact,
+        'summary': {'total_checks': len(checks), 'passed': passed, 'failed': failed},
+        'issues_by_severity': severity_counts,
+        'findings': findings,
+    }
+
+
+def _build_email_scorecard_data(scan_id, checks):
+    if not checks:
+        return {
+            'scan_id': scan_id,
+            'factor': 'Email Security',
+            'grade': 'N/A',
+            'score': 0,
+            'impact': 0.0,
+            'summary': {'total_checks': 0, 'passed': 0, 'failed': 0},
+            'issues_by_severity': _empty_severity_counts(),
+            'findings': [],
+        }
+
+    severity_counts = _empty_severity_counts()
+    findings = []
+    issue_points = 0
+    max_points = 0
+    passed = 0
+    failed = 0
+
+    for item in checks:
+        risk = _normalize_risk(item.risk_rating)
+        weight = _SEVERITY_WEIGHT.get(risk, 4)
+        max_points += weight
+        is_issue = (item.status or '').upper() != 'PASS'
+        if is_issue:
+            failed += 1
+            issue_points += weight
+            _add_severity_count(severity_counts, risk)
+        else:
+            passed += 1
+        findings.append(
+            {
+                'check_type': item.check_type,
+                'status': item.status,
+                'risk_rating': risk,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'details': item.details,
+                'record_value': item.record_value,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+                'is_issue': is_issue,
+            }
+        )
+
+    score, impact, grade = _compute_grade_score(issue_points, max_points)
+    return {
+        'scan_id': scan_id,
+        'factor': 'Email Security',
+        'grade': grade,
+        'score': score,
+        'impact': impact,
+        'summary': {'total_checks': len(checks), 'passed': passed, 'failed': failed},
+        'issues_by_severity': severity_counts,
+        'findings': findings,
+    }
+
+
+def _build_dns_scorecard_data(scan_id, checks):
+    if not checks:
+        return {
+            'scan_id': scan_id,
+            'factor': 'DNS Health',
+            'grade': 'N/A',
+            'score': 0,
+            'impact': 0.0,
+            'summary': {'total_checks': 0, 'passed': 0, 'failed': 0},
+            'issues_by_severity': _empty_severity_counts(),
+            'findings': [],
+        }
+
+    severity_counts = _empty_severity_counts()
+    findings = []
+    issue_points = 0
+    max_points = 0
+    passed = 0
+    failed = 0
+
+    for item in checks:
+        risk = _normalize_risk(item.risk_rating)
+        weight = _SEVERITY_WEIGHT.get(risk, 4)
+        max_points += weight
+        cvss = float(item.cvss_score) if item.cvss_score is not None else 0.0
+        is_issue = not (risk == 'Low' and cvss <= 0.0)
+        if is_issue:
+            failed += 1
+            issue_points += weight
+            _add_severity_count(severity_counts, risk)
+        else:
+            passed += 1
+        findings.append(
+            {
+                'check_type': item.check_type,
+                'finding': item.finding,
+                'status': 'issue' if is_issue else 'pass',
+                'risk_rating': risk,
+                'cvss_score': item.cvss_score,
+                'asset': item.asset.value if item.asset else None,
+                'example': item.example,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+                'is_issue': is_issue,
+            }
+        )
+
+    score, impact, grade = _compute_grade_score(issue_points, max_points)
+    return {
+        'scan_id': scan_id,
+        'factor': 'DNS Health',
+        'grade': grade,
+        'score': score,
+        'impact': impact,
+        'summary': {'total_checks': len(checks), 'passed': passed, 'failed': failed},
+        'issues_by_severity': severity_counts,
+        'findings': findings,
+    }
+
+
+def _build_library_scorecard_data(scan_id, checks):
+    if not checks:
+        return {
+            'scan_id': scan_id,
+            'factor': 'Library Security',
+            'grade': 'A',
+            'score': 100,
+            'impact': 0.0,
+            'summary': {'total_checks': 0, 'passed': 0, 'failed': 0},
+            'issues_by_severity': _empty_severity_counts(),
+            'findings': [],
+        }
+
+    severity_counts = _empty_severity_counts()
+    findings = []
+    issue_points = 0
+    max_points = 0
+    passed = 0
+    failed = 0
+
+    risk_to_cvss = {
+        'Critical': 9.5,
+        'High': 7.5,
+        'Medium': 5.0,
+        'Low': 2.5,
+    }
+
+    for item in checks:
+        risk = _normalize_risk(item.risk_level)
+        weight = _SEVERITY_WEIGHT.get(risk, 4)
+        max_points += weight
+
+        status_value = (item.vulnerability_status or '').lower()
+        is_issue = status_value != 'up-to-date'
+
+        if is_issue:
+            failed += 1
+            issue_points += weight
+            _add_severity_count(severity_counts, risk)
+        else:
+            passed += 1
+
+        findings.append(
+            {
+                'library_name': item.library_name,
+                'detected_version': item.detected_version,
+                'latest_version': item.latest_version,
+                'status': item.vulnerability_status,
+                'risk_rating': risk,
+                'cvss_score': risk_to_cvss.get(risk, 0.0),
+                'asset': item.asset.value if item.asset else None,
+                'source_urls': item.source_urls,
+                'recommendation': item.recommendation,
+                'checked_at': item.checked_at,
+                'is_issue': is_issue,
+            }
+        )
+
+    score, impact, grade = _compute_grade_score(issue_points, max_points)
+    return {
+        'scan_id': scan_id,
+        'factor': 'Library Security',
+        'grade': grade,
+        'score': score,
+        'impact': impact,
+        'summary': {'total_checks': len(checks), 'passed': passed, 'failed': failed},
+        'issues_by_severity': severity_counts,
+        'findings': findings,
+    }
+
+
+@api_view(['GET'])
+def scan_header_scorecard(request, scan_id):
+    """
+    Security headers grading endpoint for frontend scorecard UIs.
+    GET /api/scans/{scan_id}/header-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    checks = list(
+        SecurityHeaderCheck.objects.filter(scan=scan)
+        .select_related('asset')
+        .order_by('header')
+    )
+    return Response(_build_header_scorecard_data(scan_id, checks))
+
+
+@api_view(['GET'])
+def scan_ssl_scorecard(request, scan_id):
+    """
+    SSL/TLS grading endpoint for frontend scorecard UIs.
+    GET /api/scans/{scan_id}/ssl-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    checks = list(SSLTLSCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+
+    return Response(_build_ssl_scorecard_data(scan_id, checks))
+
+
+@api_view(['GET'])
+def scan_email_scorecard(request, scan_id):
+    """
+    Email security grading endpoint for frontend scorecard UIs.
+    GET /api/scans/{scan_id}/email-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    checks = list(EmailSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+
+    return Response(_build_email_scorecard_data(scan_id, checks))
+
+
+@api_view(['GET'])
+def scan_dns_scorecard(request, scan_id):
+    """
+    DNS health grading endpoint for frontend scorecard UIs.
+    GET /api/scans/{scan_id}/dns-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    checks = list(DNSSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+
+    return Response(_build_dns_scorecard_data(scan_id, checks))
+
+
+@api_view(['GET'])
+def scan_library_scorecard(request, scan_id):
+    """
+    Frontend library grading endpoint for frontend scorecard UIs.
+    GET /api/scans/{scan_id}/library-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+    checks = list(
+        FrontendLibraryCheck.objects.filter(scan=scan)
+        .select_related('asset')
+        .order_by('library_name', 'id')
+    )
+
+    return Response(_build_library_scorecard_data(scan_id, checks))
+
+
+@api_view(['GET'])
+def scan_overall_scorecard(request, scan_id):
+    """
+    Combined scorecard across key factors for dashboard rendering.
+    GET /api/scans/{scan_id}/overall-scorecard/
+    """
+    scan = get_object_or_404(Scan, id=scan_id)
+
+    header_checks = list(SecurityHeaderCheck.objects.filter(scan=scan).select_related('asset').order_by('header'))
+    ssl_checks = list(SSLTLSCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+    email_checks = list(EmailSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+    dns_checks = list(DNSSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
+    library_checks = list(
+        FrontendLibraryCheck.objects.filter(scan=scan)
+        .select_related('asset')
+        .order_by('library_name', 'id')
+    )
+
+    header_data = _build_header_scorecard_data(scan_id, header_checks)
+    ssl_data = _build_ssl_scorecard_data(scan_id, ssl_checks)
+    email_data = _build_email_scorecard_data(scan_id, email_checks)
+    dns_data = _build_dns_scorecard_data(scan_id, dns_checks)
+    library_data = _build_library_scorecard_data(scan_id, library_checks)
+
+    factors = [header_data, ssl_data, email_data, dns_data, library_data]
+    scored_factors = [item for item in factors if item.get('grade') != 'N/A']
+
+    if scored_factors:
+        avg_score = int(round(sum(item['score'] for item in scored_factors) / len(scored_factors)))
+        avg_impact = round(sum(item['impact'] for item in scored_factors) / len(scored_factors), 1)
+        overall_grade = _score_to_grade(avg_score)
+    else:
+        avg_score = 0
+        avg_impact = 0.0
+        overall_grade = 'N/A'
+
+    return Response(
+        {
+            'scan_id': scan.id,
+            'overall': {
+                'grade': overall_grade,
+                'score': avg_score,
+                'impact': avg_impact,
+                'factors_count': len(scored_factors),
+            },
+            'factors': factors,
+        }
+    )
+
+
 @api_view(['GET'])
 def scan_dns_checks(request, scan_id):
     """
@@ -1075,6 +1913,253 @@ def scan_findings(request, scan_id):
         'has_previous': page > 1,
         'findings': serializer.data
     })
+
+
+@api_view(['GET'])
+def scan_report_download(request, scan_id, report_format='json'):
+    """
+    Download generated report for a scan.
+    GET /api/scans/{scan_id}/report/download/{format}/
+    GET /api/report/download/{scan_id}/{format}/
+
+    Query param format remains supported for backward compatibility.
+    """
+    report_format = (report_format or request.GET.get('format', 'json')).lower()
+    logger.info(
+        "scan_report_download called path=%s scan_id=%s format=%s",
+        request.path,
+        scan_id,
+        report_format,
+    )
+    scan = Scan.objects.filter(id=scan_id).first()
+    if not scan:
+        return Response(
+            {
+                'error': 'Scan not found',
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    helper = ScanViewSet()
+
+    if report_format not in {'json', 'csv', 'pdf', 'docx'}:
+        return Response(
+            {'error': "Invalid format. Use 'json', 'csv', 'pdf', or 'docx'."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        payload = helper._build_scan_report_payload(scan)
+    except Exception as exc:
+        logger.exception("Failed to build report payload for scan_id=%s", scan_id)
+        return Response(
+            {
+                'error': 'Failed to build report payload',
+                'detail': str(exc),
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+
+    if report_format == 'json':
+        response = HttpResponse(
+            json.dumps(payload, default=str, indent=2),
+            content_type='application/json',
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="scan_{scan.id}_report_{timestamp}.json"'
+        )
+        return response
+
+    if report_format == 'pdf':
+        content, error = helper._generate_pdf_report(payload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = HttpResponse(content, content_type='application/pdf')
+        response['Content-Disposition'] = (
+            f'attachment; filename="scan_{scan.id}_report_{timestamp}.pdf"'
+        )
+        return response
+
+    if report_format == 'docx':
+        content, error = helper._generate_docx_report(payload)
+        if error:
+            return Response({'error': error}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = HttpResponse(
+            content,
+            content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="scan_{scan.id}_report_{timestamp}.docx"'
+        )
+        return response
+
+    response = HttpResponse(content_type='text/csv')
+    response['Content-Disposition'] = (
+        f'attachment; filename="scan_{scan.id}_report_{timestamp}.csv"'
+    )
+
+    writer = csv.writer(response)
+
+    writer.writerow(['scan_id', payload['summary']['scan_id']])
+    writer.writerow(['scan_type', payload['summary']['scan_type']])
+    writer.writerow(['status', payload['summary']['status']])
+    writer.writerow(['started_at', payload['summary']['started_at']])
+    writer.writerow(['finished_at', payload['summary']['finished_at']])
+    writer.writerow(['duration_seconds', payload['summary']['duration_seconds']])
+    writer.writerow(['total_assets_scanned', payload['summary']['total_assets_scanned']])
+    writer.writerow(['total_findings', payload['summary']['total_findings']])
+    writer.writerow(['critical_findings', payload['summary']['critical_findings']])
+    writer.writerow(['high_findings', payload['summary']['high_findings']])
+    writer.writerow(['medium_findings', payload['summary']['medium_findings']])
+    writer.writerow(['low_findings', payload['summary']['low_findings']])
+    writer.writerow([])
+
+    writer.writerow([
+        'finding_id',
+        'title',
+        'category',
+        'risk_rating',
+        'status',
+        'cvss_score',
+        'nuclei_template_id',
+        'asset',
+        'domain',
+        'cve_ids',
+        'recommendation',
+        'first_seen',
+        'last_seen',
+    ])
+
+    for finding in payload['findings']:
+        writer.writerow([
+            finding['id'],
+            finding['title'],
+            finding['category'],
+            finding['risk_rating'],
+            finding['status'],
+            finding['cvss_score'],
+            finding['nuclei_template_id'],
+            finding['asset'],
+            finding['domain'],
+            ';'.join(finding['cve_ids']),
+            finding['recommendation'],
+            finding['first_seen'],
+            finding['last_seen'],
+        ])
+
+    return response
+
+
+@api_view(['GET'])
+def report_download_test(request):
+    """Simple route test endpoint for download path troubleshooting."""
+    logger.info("report_download_test endpoint hit")
+    return Response(
+        {
+            'ok': True,
+            'message': 'report download test route is reachable',
+            'hint': 'If this works but download fails, issue is inside report handler logic.',
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(['GET'])
+def report_download_debug(request, scan_id, report_format='json'):
+
+    """Debug endpoint to isolate where report generation fails."""
+    report_format = (report_format or request.GET.get('format', 'json')).lower()
+    scan = Scan.objects.filter(id=scan_id).first()
+
+    if not scan:
+        return Response(
+            {
+                'ok': False,
+                'stage': 'scan_lookup',
+                'error': 'Scan not found',
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    helper = ScanViewSet()
+
+    try:
+        payload = helper._build_scan_report_payload(scan)
+    except Exception as exc:
+        logger.exception("report_download_debug payload failure scan_id=%s", scan_id)
+        return Response(
+            {
+                'ok': False,
+                'stage': 'payload',
+                'error': str(exc),
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    if report_format == 'pdf':
+        content, error = helper._generate_pdf_report(payload)
+        if error:
+            return Response(
+                {
+                    'ok': False,
+                    'stage': 'pdf_generation',
+                    'error': error,
+                    'scan_id': scan_id,
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(
+            {
+                'ok': True,
+                'stage': 'pdf_generation',
+                'bytes': len(content),
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    if report_format == 'docx':
+        content, error = helper._generate_docx_report(payload)
+        if error:
+            return Response(
+                {
+                    'ok': False,
+                    'stage': 'docx_generation',
+                    'error': error,
+                    'scan_id': scan_id,
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(
+            {
+                'ok': True,
+                'stage': 'docx_generation',
+                'bytes': len(content),
+                'scan_id': scan_id,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    return Response(
+        {
+            'ok': True,
+            'stage': 'payload',
+            'scan_id': scan_id,
+            'format': report_format,
+            'summary': {
+                'status': payload['summary']['status'],
+                'total_assets_scanned': payload['summary']['total_assets_scanned'],
+                'total_findings': payload['summary']['total_findings'],
+            },
+        },
+        status=status.HTTP_200_OK,
+    )
 
 @api_view(['GET'])
 def all_findings(request):
@@ -1300,10 +2385,13 @@ def execute_nuclei_scan(request):
             logger.info(f"Running Nuclei scan on {asset.value}")
             try:
                 results = run_nuclei_scan(asset.value, templates=templates)
-                _process_nuclei_results(scan, asset, results, templates)
-                logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+                if results:
+                    _process_nuclei_results(scan, asset, results, templates)
+                    logger.info(f"✓ Nuclei scan completed: {len(results)} results")
+                else:
+                    logger.info(f"ℹ️ Nuclei scan skipped or returned no results (templates may be unavailable on Windows)")
             except Exception as e:
-                logger.error(f"❌ Nuclei scan failed: {e}")
+                logger.warning(f"⚠️ Nuclei scan failed: {e}. Continuing with other checks...")
             
             # 2.5. Check security headers directly via HTTP
             logger.info(f"🔍 === SECURITY HEADERS CHECK STARTED ===")
@@ -1342,6 +2430,7 @@ def execute_nuclei_scan(request):
                     _process_technology_results(scan, asset, tech_result)
                     
                     detected_libraries = tech_result.get('libraries', [])
+                    detected_libraries = _augment_library_detections_with_analytics(tech_result, detected_libraries)
                     detected_cms = tech_result.get('cms')
                     
                     logger.info(f"✓ Detected {len(detected_libraries)} libraries")
@@ -1358,6 +2447,7 @@ def execute_nuclei_scan(request):
                         lib_name = lib.get('name')
                         lib_version = lib.get('version', 'Unknown')  # Default to 'Unknown'
                         lib_source = lib.get('source', 'unknown')
+                        latest_version = 'Unknown'
                         
                         logger.info(f"\n--- Processing: {lib_name}@{lib_version} (source: {lib_source}) ---")
                         
@@ -1374,6 +2464,15 @@ def execute_nuclei_scan(request):
                             lib_version.strip() != '' and
                             lib_version.lower() not in ['unknown', 'latest', 'saas', 'n/a']
                         )
+
+                        try:
+                            ecosystem = get_ecosystem_for_library(lib_name)
+                            resolved_latest_version = fetch_latest_library_version(lib_name, ecosystem)
+                            if resolved_latest_version:
+                                latest_version = resolved_latest_version
+                                logger.info(f"📦 Latest registry version for {lib_name}: {latest_version}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Latest version lookup failed for {lib_name}: {e}")
                         
                         if can_check_cve and check_cves:
                             logger.info(f"🔍 Checking CVEs for {lib_name}@{lib_version}")
@@ -1424,9 +2523,14 @@ def execute_nuclei_scan(request):
                                         cve_id = vuln.get('cve_id') or vuln.get('primary_cve') or vuln.get('id')
                                         logger.info(f"  {i}. {cve_id}: CVSS {vuln.get('cvss_score', 0.0)}")
                                 else:
-                                    vuln_status = 'up-to-date'
-                                    recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
-                                    logger.info(f"✓ No CVEs found")
+                                    if latest_version != 'Unknown' and version_compare(lib_version, latest_version) < 0:
+                                        vuln_status = 'outdated'
+                                        recommendation = f"Update {lib_name} from {lib_version} to {latest_version}"
+                                        logger.info(f"⚠️ No CVEs found, but {lib_name} is outdated ({lib_version} < {latest_version})")
+                                    else:
+                                        vuln_status = 'up-to-date'
+                                        recommendation = f"No known vulnerabilities for {lib_name} {lib_version}"
+                                        logger.info(f"✓ No CVEs found")
                                     
                             except Exception as e:
                                 logger.error(f"❌ CVE check failed for {lib_name}: {e}")
@@ -1448,13 +2552,30 @@ def execute_nuclei_scan(request):
                             library_name=lib_name,
                             detected_version=lib_version,
                             defaults={
-                                'latest_version': 'Unknown',
+                                'latest_version': latest_version,
                                 'vulnerability_status': vuln_status,
                                 'risk_level': risk_level,
                                 'source_urls': [lib.get('source_url', asset_url)],
                                 'recommendation': recommendation
                             }
                         )
+
+                        if not created:
+                            updates = []
+                            if library_check.latest_version != latest_version:
+                                library_check.latest_version = latest_version
+                                updates.append('latest_version')
+                            if library_check.vulnerability_status != vuln_status:
+                                library_check.vulnerability_status = vuln_status
+                                updates.append('vulnerability_status')
+                            if library_check.risk_level != risk_level:
+                                library_check.risk_level = risk_level
+                                updates.append('risk_level')
+                            if library_check.recommendation != recommendation:
+                                library_check.recommendation = recommendation
+                                updates.append('recommendation')
+                            if updates:
+                                library_check.save(update_fields=updates)
                         
                         if created:
                             logger.info(f"✓✓✓ SAVED to DB: FrontendLibraryCheck id={library_check.id}")
@@ -1839,32 +2960,87 @@ def _process_technology_results(scan, asset, tech_result):
     Save detected technologies and CMS into DB
     """
 
-    technologies = tech_result.get('technologies', [])
-    cms = tech_result.get('cms')
+    def _save_technology(tech_name, tech_version='Unknown', tech_category='general'):
+        if not tech_name:
+            return
 
-    # ---------------- GENERAL TECHNOLOGIES ----------------
-    for tech in technologies:
-        tech_name = tech.get('name')
-        tech_version = tech.get('version', 'Unknown')
-        tech_category = tech.get('category', 'general')
+        latest_version = 'Unknown'
 
-        TechnologyCheck.objects.get_or_create(
+        if supports_latest_version_lookup(tech_name):
+            try:
+                resolved_latest = fetch_latest_library_version(tech_name)
+                if resolved_latest:
+                    latest_version = resolved_latest
+            except Exception as e:
+                logger.warning(f"⚠️ Latest version lookup failed for technology {tech_name}: {e}")
+
+        technology_check, created = TechnologyCheck.objects.get_or_create(
             scan=scan,
             asset=asset,
             technology_name=tech_name,
             version=tech_version,
-            category=tech_category
+            category=tech_category,
+            defaults={
+                'latest_version': latest_version,
+            }
+        )
+
+        if not created and technology_check.latest_version != latest_version:
+            technology_check.latest_version = latest_version
+            technology_check.save(update_fields=['latest_version'])
+
+    technologies = list(tech_result.get('technologies', []))
+    cms = tech_result.get('cms')
+    web_server = tech_result.get('web_server')
+    programming_languages = tech_result.get('programming_languages', [])
+    cdn = tech_result.get('cdn', [])
+    analytics = tech_result.get('analytics', [])
+    security = tech_result.get('security', [])
+    cms_extensions = tech_result.get('cms_extensions', {})
+
+    if web_server:
+        technologies.append({
+            'name': web_server.get('name'),
+            'version': web_server.get('version', 'Unknown'),
+            'category': web_server.get('type', 'Web Server')
+        })
+
+    for item in programming_languages + cdn + analytics + security:
+        technologies.append({
+            'name': item.get('name'),
+            'version': item.get('version', 'Unknown'),
+            'category': item.get('type', 'general')
+        })
+
+    # ---------------- GENERAL TECHNOLOGIES ----------------
+    for tech in technologies:
+        _save_technology(
+            tech.get('name'),
+            tech.get('version', 'Unknown'),
+            tech.get('category') or tech.get('type', 'general')
         )
 
     # ---------------- CMS ----------------
     if cms:
-        TechnologyCheck.objects.get_or_create(
-            scan=scan,
-            asset=asset,
-            technology_name=cms.get('name'),
-            version=cms.get('version', 'Unknown'),
-            category='CMS'
+        _save_technology(
+            cms.get('name'),
+            cms.get('version', 'Unknown'),
+            'CMS'
         )
+
+    # ---------------- CMS EXTENSIONS ----------------
+    for plugin in cms_extensions.get('plugins', []):
+        _save_technology(plugin.get('name'), plugin.get('version', 'Unknown'), plugin.get('type', 'CMS Plugin'))
+
+    theme = cms_extensions.get('themes')
+    if theme:
+        _save_technology(theme.get('name'), theme.get('version', 'Unknown'), theme.get('type', 'CMS Theme'))
+
+    for module in cms_extensions.get('modules', []):
+        _save_technology(module.get('name'), module.get('version', 'Unknown'), module.get('type', 'CMS Module'))
+
+    for extension in cms_extensions.get('extensions', []):
+        _save_technology(extension.get('name'), extension.get('version', 'Unknown'), extension.get('type', 'CMS Extension'))
 
 # def _process_library_detection(scan, asset, tech_result, check_cves):
 
@@ -2130,16 +3306,20 @@ def check_security_headers(target_url: str) -> Dict[str, Dict[str, str]]:
             
             if header_value:
                 status_val = 'present'
+                risk_rating = 'Low'
+                cvss_score = None
                 logger.info(f"  ✓ {header_name}: PRESENT")
             else:
                 status_val = 'missing'
+                risk_rating = header_info['risk_rating']
+                cvss_score = header_info['cvss_score']
                 logger.info(f"  ✗ {header_name}: MISSING")
             
             findings[header_name] = {
                 'status': status_val,
                 'value': header_value,
-                'risk_rating': header_info['risk_rating'],
-                'cvss_score': header_info['cvss_score'],
+                'risk_rating': risk_rating,
+                'cvss_score': cvss_score,
                 'recommendation': header_info['recommendation']
             }
         

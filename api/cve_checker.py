@@ -9,6 +9,8 @@ import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
+from packaging.version import InvalidVersion, Version
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,9 @@ LIBRARY_NAME_MAPPING = {
     'nuxt': 'nuxt',
     
     # CSS frameworks
-    'font-awesome': 'font-awesome',
+    'font-awesome': '@fortawesome/fontawesome-free',
+    'font awesome': '@fortawesome/fontawesome-free',
+    'fontawesome': '@fortawesome/fontawesome-free',
     'bulma': 'bulma',
     'tailwind': 'tailwindcss',
     'tailwind css': 'tailwindcss',
@@ -62,6 +66,11 @@ LIBRARY_NAME_MAPPING = {
     
     # WordPress
     'wordpress': 'wordpress',
+    'joomla': 'joomla/joomla-cms',
+    'drupal': 'drupal/core',
+    'magento': 'magento/product-community-edition',
+    'prestashop': 'prestashop/prestashop',
+    'ghost': 'ghost',
 
     'aos': 'aos',
     'gsap': 'gsap',
@@ -73,6 +82,113 @@ def normalize_library_name(library_name: str) -> str:
     """Normalize library name for package registry lookup"""
     library_lower = library_name.lower().strip()
     return LIBRARY_NAME_MAPPING.get(library_lower, library_lower)
+
+
+def supports_latest_version_lookup(library_name: str) -> bool:
+    """Return True when the package/CMS name can be resolved against a known source."""
+    normalized_name = normalize_library_name(library_name)
+
+    if library_name.lower().strip() in LIBRARY_NAME_MAPPING:
+        return True
+
+    if normalized_name == 'wordpress':
+        return True
+
+    if normalized_name.startswith('@'):
+        return True
+
+    if normalized_name in {
+        'ghost',
+        'jquery',
+        'react',
+        'react-dom',
+        'vue',
+        'bootstrap',
+        'bulma',
+        'tailwindcss',
+        'django',
+        'flask',
+        'next',
+        'nuxt',
+        'express',
+        'symfony/symfony',
+        'laravel/framework',
+        'joomla/joomla-cms',
+        'drupal/core',
+        'magento/product-community-edition',
+        'prestashop/prestashop',
+    }:
+        return True
+
+    return False
+
+
+def fetch_latest_library_version(
+    library_name: str,
+    ecosystem: Optional[str] = None
+) -> Optional[str]:
+    """Fetch the latest available package version from the relevant registry."""
+    normalized_name = normalize_library_name(library_name)
+    ecosystem = ecosystem or get_ecosystem_for_library(normalized_name)
+    ecosystem_lower = ecosystem.lower()
+
+    try:
+        if normalized_name == 'wordpress':
+            response = requests.get(
+                'https://api.wordpress.org/core/version-check/1.7/',
+                timeout=15
+            )
+            if response.status_code == 200:
+                offers = response.json().get('offers', [])
+                for offer in offers:
+                    current = offer.get('current')
+                    if current:
+                        return current
+
+        if ecosystem_lower == 'npm':
+            response = requests.get(
+                f"https://registry.npmjs.org/{quote(normalized_name, safe='')}",
+                timeout=15
+            )
+            if response.status_code == 200:
+                return response.json().get('dist-tags', {}).get('latest')
+
+        elif ecosystem_lower == 'pypi':
+            response = requests.get(
+                f"https://pypi.org/pypi/{quote(normalized_name, safe='')}/json",
+                timeout=15
+            )
+            if response.status_code == 200:
+                return response.json().get('info', {}).get('version')
+
+        elif ecosystem_lower == 'packagist':
+            response = requests.get(
+                f"https://repo.packagist.org/p2/{quote(normalized_name, safe='')}.json",
+                timeout=15
+            )
+            if response.status_code == 200:
+                packages = response.json().get('packages', {}).get(normalized_name, [])
+                versions = [pkg.get('version') for pkg in packages if pkg.get('version')]
+                stable_versions = [version for version in versions if 'dev' not in version.lower()]
+                candidates = stable_versions or versions
+                if candidates:
+                    return sorted(candidates, key=lambda version: _safe_version_key(version), reverse=True)[0]
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Latest version lookup failed for {normalized_name} ({ecosystem}): {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected latest version lookup error for {normalized_name} ({ecosystem}): {e}")
+
+    return None
+
+
+def _safe_version_key(version: str):
+    """Build a comparable key for version sorting with a string fallback."""
+    cleaned_version = version.lstrip('v').strip()
+    try:
+        return (0, Version(cleaned_version))
+    except InvalidVersion:
+        return (1, cleaned_version)
 
 
 # ============================================
@@ -480,6 +596,23 @@ def calculate_severity_from_cvss(cvss_score: float) -> str:
 def get_ecosystem_for_library(library_name: str) -> str:
     """Automatically determine ecosystem based on library name"""
     library_lower = library_name.lower()
+    normalized_name = normalize_library_name(library_name).lower()
+
+    if normalized_name == 'wordpress':
+        return 'wordpress'
+
+    if normalized_name.startswith('@'):
+        return 'npm'
+
+    if normalized_name in {
+        'symfony/symfony',
+        'laravel/framework',
+        'joomla/joomla-cms',
+        'drupal/core',
+        'magento/product-community-edition',
+        'prestashop/prestashop',
+    }:
+        return 'Packagist'
     
     # Frontend JavaScript libraries - these are in npm
     frontend_libs = [
@@ -617,26 +750,15 @@ def version_compare(version1: str, version2: str) -> int:
     Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
     """
     try:
-        # Remove 'v' prefix if present
-        v1 = version1.lstrip('v')
-        v2 = version2.lstrip('v')
-        
-        v1_parts = [int(x) for x in v1.split('.') if x.isdigit()]
-        v2_parts = [int(x) for x in v2.split('.') if x.isdigit()]
-        
-        # Pad shorter version with zeros
-        max_len = max(len(v1_parts), len(v2_parts))
-        v1_parts += [0] * (max_len - len(v1_parts))
-        v2_parts += [0] * (max_len - len(v2_parts))
-        
-        for i in range(max_len):
-            if v1_parts[i] < v2_parts[i]:
-                return -1
-            elif v1_parts[i] > v2_parts[i]:
-                return 1
-        
+        v1 = Version(version1.lstrip('v').strip())
+        v2 = Version(version2.lstrip('v').strip())
+
+        if v1 < v2:
+            return -1
+        if v1 > v2:
+            return 1
         return 0
-    except:
+    except (InvalidVersion, AttributeError, TypeError, ValueError):
         # Fallback to string comparison
         if version1 < version2:
             return -1

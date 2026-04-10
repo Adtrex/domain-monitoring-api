@@ -43,12 +43,36 @@ def detect_frontend_libraries(url: str, timeout: int = 10) -> List[Dict[str, Any
         
         # Parse HTML
         soup = BeautifulSoup(html, 'html.parser')
+
+        # Debug visibility: log all script tags seen by the crawler.
+        script_tags = soup.find_all('script')
+        logger.info(f"[script-debug] Found {len(script_tags)} script tags on {url}")
+        for idx, script in enumerate(script_tags, 1):
+            src = (script.get('src') or '').strip()
+            if src:
+                if src.startswith(('http://', 'https://')):
+                    script_url = src
+                elif src.startswith('//'):
+                    script_url = 'https:' + src
+                else:
+                    script_url = urljoin(url, src)
+                logger.info(f"[script-debug] #{idx} external: {script_url}")
+            else:
+                inline_js = (script.get_text() or '').strip()
+                inline_preview = re.sub(r'\s+', ' ', inline_js)[:240]
+                if inline_preview:
+                    logger.info(f"[script-debug] #{idx} inline: {inline_preview}")
+                else:
+                    logger.info(f"[script-debug] #{idx} inline: <empty>")
         
         # 1. Check inline JavaScript
         libraries.extend(_detect_from_inline_js(html))
         
         # 2. Check script src attributes (ENHANCED)
         libraries.extend(_detect_from_script_tags(soup, url, headers, timeout))
+
+        # 2.5. Check raw HTML signatures for dynamically injected script URLs
+        libraries.extend(_detect_from_raw_html_signatures(html))
         
         # 3. Check link href attributes (CSS libraries)
         libraries.extend(_detect_from_link_tags(soup, url))
@@ -223,6 +247,29 @@ def _detect_from_global_objects(html: str) -> List[Dict[str, Any]]:
     return libraries
 
 
+def _detect_from_raw_html_signatures(html: str) -> List[Dict[str, Any]]:
+    """Detect known libraries from raw HTML/inline script URL signatures."""
+    libraries = []
+
+    # Cloudflare beacon is often injected dynamically and may not appear as a direct script src tag.
+    beacon_match = re.search(
+        r'(?:https?:)?//static\.cloudflareinsights\.com/beacon\.min\.js(?:/([a-z0-9]+))?',
+        html,
+        re.IGNORECASE,
+    )
+    if beacon_match:
+        libraries.append(
+            {
+                'name': 'Cloudflare Beacon',
+                'version': beacon_match.group(1) or 'Unknown',
+                'source': 'raw_html_signature',
+                'confidence': 'medium',
+            }
+        )
+
+    return libraries
+
+
 def _detect_from_script_tags(soup: BeautifulSoup, base_url: str, headers: Dict, timeout: int) -> List[Dict[str, Any]]:
     """Detect libraries from script src attributes - ENHANCED VERSION"""
     libraries = []
@@ -378,6 +425,15 @@ def _detect_from_script_tags(soup: BeautifulSoup, base_url: str, headers: Dict, 
             ],
             'identifiers': ['gsap'],
             'cdn_patterns': ['cdnjs.cloudflare.com/ajax/libs/gsap']
+        },
+        'Cloudflare Beacon': {
+            'patterns': [
+                r'cloudflareinsights\.com/beacon\.min\.js/(v?[a-f0-9]{8,})',
+                r'beacon\.min\.js/(v?[a-f0-9]{8,})',
+            ],
+            'identifiers': ['cloudflareinsights.com/beacon.min.js', 'beacon.min.js'],
+            'cdn_patterns': ['static.cloudflareinsights.com/beacon.min.js'],
+            'allow_unknown_version': True,
         }
     }
     
@@ -401,12 +457,15 @@ def _detect_from_script_tags(soup: BeautifulSoup, base_url: str, headers: Dict, 
             
             version = None
             detection_method = None
+            library_matched = False
             
             # Method 1: Check URL patterns
             for pattern in config['patterns']:
                 match = re.search(pattern, src_lower, re.IGNORECASE)
                 if match:
-                    version = match.group(1)
+                    library_matched = True
+                    if match.lastindex:
+                        version = match.group(1)
                     detection_method = 'url_pattern'
                     break
             
@@ -414,27 +473,36 @@ def _detect_from_script_tags(soup: BeautifulSoup, base_url: str, headers: Dict, 
             if not version:
                 for identifier in config['identifiers']:
                     if identifier in src_lower:
+                        library_matched = True
                         # Found the library, now try to fetch version from content
                         script_content = _fetch_script_head(src_abs, headers, timeout=5)
                         if script_content:
                             version = _extract_version_from_script_content(script_content, lib_name)
                             if version:
                                 detection_method = 'script_content'
+                        if not detection_method:
+                            detection_method = 'identifier'
                         break
             
             # Method 3: Check CDN patterns (even without version in URL, fetch content)
             if not version:
                 for cdn_pattern in config['cdn_patterns']:
                     if cdn_pattern in src_lower:
+                        library_matched = True
                         script_content = _fetch_script_head(src_abs, headers, timeout=5)
                         if script_content:
                             version = _extract_version_from_script_content(script_content, lib_name)
                             if version:
                                 detection_method = 'cdn_content'
+                        if not detection_method:
+                            detection_method = 'cdn_pattern'
                         break
             
-            # If we found a version, add it
-            if version:
+            # Add detection when version exists, or when config allows unknown versions.
+            allow_unknown_version = config.get('allow_unknown_version', False)
+            if version or (library_matched and allow_unknown_version):
+                if not version:
+                    version = 'Unknown'
                 detected_scripts[lib_name] = True
                 libraries.append({
                     'name': lib_name,
@@ -498,8 +566,14 @@ def _detect_from_link_tags(soup: BeautifulSoup, base_url: str) -> List[Dict[str,
                 r'fontawesome[.-](\d+\.\d+\.\d+)(?:\.min)?\.css',
                 r'font-awesome(?:\.min)?\.css(?:\?ver?=(\d+\.\d+\.\d+))?',
                 r'/font-awesome/(\d+\.\d+\.\d+)/',
+                r'@fortawesome/fontawesome-free@(\d+\.\d+\.\d+)',
+                r'/releases/v?(\d+\.\d+\.\d+)/',
             ],
-            'cdn_patterns': ['use.fontawesome.com', 'cdnjs.cloudflare.com/ajax/libs/font-awesome']
+            'cdn_patterns': [
+                'use.fontawesome.com',
+                'cdnjs.cloudflare.com/ajax/libs/font-awesome',
+                'cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free'
+            ]
         },
         'Bulma': {
             'patterns': [
@@ -1347,6 +1421,7 @@ def detect_analytics(html: str) -> List[Dict[str, Any]]:
     analytics_patterns = {
         'Google Analytics': [r'google-analytics\.com/analytics\.js', r'googletagmanager\.com/gtag/js', r'UA-\d+-\d+', r'G-[A-Z0-9]+'],
         'Google Tag Manager': [r'googletagmanager\.com/gtm\.js', r'GTM-[A-Z0-9]+'],
+        'Cloudflare Beacon': [r'static\.cloudflareinsights\.com/beacon\.min\.js', r'cloudflareinsights\.com/beacon\.min\.js'],
         'Facebook Pixel': [r'connect\.facebook\.net/.*?/fbevents\.js', r'fbq\('],
         'Hotjar': [r'static\.hotjar\.com'],
         'Matomo': [r'matomo\.js', r'piwik\.js'],

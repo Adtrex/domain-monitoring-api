@@ -85,13 +85,24 @@ class FindingSerializer(serializers.ModelSerializer):
 
 class FrontendLibraryCheckSerializer(serializers.ModelSerializer):
     asset_url = serializers.CharField(source='asset.value', read_only=True)
+    cvss_score = serializers.SerializerMethodField()
+
+    def get_cvss_score(self, obj):
+        """Derived CVSS score for frontend libraries when explicit CVSS is not persisted."""
+        risk_to_cvss = {
+            'Critical': 9.5,
+            'High': 7.5,
+            'Medium': 5.0,
+            'Low': 2.5,
+        }
+        return risk_to_cvss.get(obj.risk_level, 0.0)
     
     class Meta:
         model = FrontendLibraryCheck
         fields = [
             'id', 'scan', 'asset', 'asset_url', 'library_name', 
             'detected_version', 'latest_version', 'vulnerability_status',
-            'risk_level', 'source_urls', 'recommendation', 'checked_at'
+            'risk_level', 'cvss_score', 'source_urls', 'recommendation', 'checked_at'
         ]
 
 

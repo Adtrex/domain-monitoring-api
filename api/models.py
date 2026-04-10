@@ -356,7 +356,7 @@ class SecurityHeaderCheck(models.Model):
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='header_checks')
     header = models.CharField(max_length=200)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES)
-    cvss_score = models.FloatField()
+    cvss_score = models.FloatField(blank=True, null=True)
     risk_rating = models.CharField(max_length=20)
     recommendation = models.TextField()
     header_value = models.TextField(blank=True)
@@ -402,6 +402,7 @@ class TechnologyCheck(models.Model):
 
     technology_name = models.CharField(max_length=200)
     version = models.CharField(max_length=100, default='Unknown', blank=True, null=True)
+    latest_version = models.CharField(max_length=100, default='Unknown', blank=True, null=True)
     category = models.CharField(max_length=100, default='general')
 
     risk_level = models.CharField(

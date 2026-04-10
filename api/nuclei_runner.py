@@ -3,6 +3,23 @@ Nuclei Scanner Integration Module for CERRT
 
 This module provides integration with the Nuclei security scanner.
 It handles automatic download, execution, and result processing.
+
+WINDOWS SETUP (If Nuclei scans are skipped):
+=============================================
+1. Download Nuclei from: https://github.com/projectdiscovery/nuclei/releases
+   - Download the Windows .exe version (nuclei_X.X.X_windows_amd64.zip)
+   - Extract nuclei.exe to: <project>/bin/nuclei.exe
+
+2. Then manually download templates by running:
+   nuclei -update-templates
+   
+   Or set the templates directory:
+   nuclei -update-templates -templates-dir <project>/bin/nuclei-templates
+
+3. After templates are in place, restart your application and scans will use Nuclei.
+
+If templates still can't be found, Nuclei scans will gracefully skip and other 
+security checks (headers, libraries, technologies) will continue normally.
 """
 
 import os
@@ -67,37 +84,45 @@ def _templates_dir_has_expected_content(templates_dir: str) -> bool:
     return any(os.path.exists(path) for path in expected_paths)
 
 
-def ensure_nuclei_templates() -> Tuple[Dict[str, str], str]:
-    """Ensure Nuclei templates are present and return (env, templates_dir)."""
+def ensure_nuclei_templates() -> Optional[Tuple[Dict[str, str], str]]:
+    """Ensure Nuclei templates are present and return (env, templates_dir), or None if unavailable."""
     env = _build_nuclei_env()
 
     templates_dir = _find_templates_dir(env)
     if templates_dir and _templates_dir_has_expected_content(templates_dir):
+        logger.info(f"Using Nuclei templates directory: {templates_dir}")
         return env, templates_dir
 
     logger.info("Nuclei templates missing/incomplete. Attempting to download/update templates...")
-    proc = subprocess.run(
-        [NUCLEI_PATH, "-update-templates"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            [NUCLEI_PATH, "-update-templates"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=60,
+        )
 
-    if proc.returncode != 0:
-        logger.warning(f"Nuclei template update returned code {proc.returncode}: {proc.stderr}")
+        if proc.returncode != 0:
+            logger.warning(f"Nuclei template update returned code {proc.returncode}: {proc.stderr}")
+    except subprocess.TimeoutExpired:
+        logger.warning("Nuclei template update timed out")
+    except Exception as e:
+        logger.warning(f"Nuclei template update failed: {e}")
 
     templates_dir = _find_templates_dir(env)
-    if not templates_dir or not _templates_dir_has_expected_content(templates_dir):
-        error_msg = (
-            "Nuclei templates were not found or are incomplete after update. "
-            "On Render, ensure runtime has writable storage and network egress to download templates."
-        )
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    logger.info(f"Using Nuclei templates directory: {templates_dir}")
-    return env, templates_dir
+    if templates_dir and _templates_dir_has_expected_content(templates_dir):
+        logger.info(f"Using Nuclei templates directory: {templates_dir}")
+        return env, templates_dir
+    
+    # Gracefully skip Nuclei if templates can't be found/updated
+    logger.warning(
+        "Nuclei templates were not found or could not be downloaded. "
+        "Nuclei security checks will be skipped. "
+        "On Windows, you may need to manually run: nuclei -update-templates"
+    )
+    return None
 
 
 def resolve_template_path(template: str, templates_dir: str) -> str:
@@ -151,68 +176,87 @@ def run_nuclei_scan(target: str, templates: List[str] = None) -> List[Dict[str, 
         templates (List[str]): List of template categories/paths to use
     
     Returns:
-        List[Dict[str, Any]]: List of findings from Nuclei
+        List[Dict[str, Any]]: List of findings from Nuclei. Empty list if Nuclei is unavailable.
     
     Example:
         >>> results = run_nuclei_scan('https://example.com', templates=['ssl', 'dns'])
         >>> print(len(results))
         5
     """
-    download_nuclei()
-    nuclei_env, templates_dir = ensure_nuclei_templates()
+    try:
+        download_nuclei()
+    except Exception as e:
+        logger.warning(f"Could not download Nuclei binary: {e}. Skipping Nuclei scans.")
+        return []
+    
+    templates_info = ensure_nuclei_templates()
+    if not templates_info:
+        # Templates unavailable on Windows or other platforms - gracefully skip
+        if platform.system() == "Windows":
+            logger.info("Nuclei templates unavailable on Windows. To enable Nuclei scans, run: nuclei -update-templates")
+        else:
+            logger.info("Skipping Nuclei scan due to unavailable templates")
+        return []
+    
+    nuclei_env, templates_dir = templates_info
     templates = templates or ["ssl"]
     results = []
 
     if not os.path.exists(NUCLEI_PATH):
-        error_msg = f"Nuclei binary not found at {NUCLEI_PATH}"
-        logger.error(error_msg)
-        raise FileNotFoundError(error_msg)
+        logger.warning(f"Nuclei binary not found at {NUCLEI_PATH}. Skipping Nuclei scans.")
+        return []
 
     logger.info(f"Running Nuclei scan on {target} with templates: {templates}")
     print(f"[INFO] Scanning {target} with templates: {templates}")
 
-    for template in templates:
-        resolved_template = resolve_template_path(template, templates_dir)
-        command = [NUCLEI_PATH, "-u", target, "-t", resolved_template, "-jsonl"]
+    try:
+        for template in templates:
+            resolved_template = resolve_template_path(template, templates_dir)
+            command = [NUCLEI_PATH, "-u", target, "-t", resolved_template, "-jsonl"]
+            
+            try:
+                proc = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=nuclei_env,
+                )
+
+                # Parse JSON lines output
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if isinstance(data, dict):
+                            results.append(data)
+                        else:
+                            logger.warning(f"Skipping non-dict JSON line: {line}")
+                            print(f"[WARN] Skipping non-dict JSON line: {line}")
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse JSON line: {line}")
+                        print(f"[ERROR] Failed to parse JSON line: {line}")
+
+                # Log stderr if present
+                if proc.stderr:
+                    logger.warning(f"Nuclei stderr for template '{template}' ({resolved_template}): {proc.stderr}")
+
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Scan error for template '{template}': {e}")
+                print(f"[ERROR] Scan error for template '{template}': {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error during scan: {e}")
+                print(f"[ERROR] Unexpected error: {e}")
         
-        try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=nuclei_env,
-            )
+    except Exception as e:
+        logger.warning(f"Nuclei scan failed with exception: {e}. Returning empty results.")
+        print(f"[WARN] Nuclei scan failed: {e}")
+        return []
 
-            # Parse JSON lines output
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if isinstance(data, dict):
-                        results.append(data)
-                    else:
-                        logger.warning(f"Skipping non-dict JSON line: {line}")
-                        print(f"[WARN] Skipping non-dict JSON line: {line}")
-                except json.JSONDecodeError:
-                    logger.error(f"Failed to parse JSON line: {line}")
-                    print(f"[ERROR] Failed to parse JSON line: {line}")
-
-            # Log stderr if present
-            if proc.stderr:
-                logger.warning(f"Nuclei stderr for template '{template}' ({resolved_template}): {proc.stderr}")
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Scan error for template '{template}': {e}")
-            print(f"[ERROR] Scan error for template '{template}': {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error during scan: {e}")
-            print(f"[ERROR] Unexpected error: {e}")
-
-    logger.info(f"Scan completed. Found {len(results)} issues.")
-    print(f"[INFO] Scan completed. Found {len(results)} issues.")
+    logger.info(f"Nuclei scan completed. Found {len(results)} results.")
+    print(f"[INFO] Nuclei scan completed. Found {len(results)} results.")
     
     return results
 

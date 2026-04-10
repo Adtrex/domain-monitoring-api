@@ -16,8 +16,12 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from api import views as api_views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # Explicit report download aliases to avoid URL routing conflicts.
+    path('api/report/download/<int:scan_id>/', api_views.scan_report_download, name='api-report-download'),
+    path('api/scans/<int:scan_id>/report/download/', api_views.scan_report_download, name='api-scan-report-download'),
     path('api/', include('api.urls')),
 ]
