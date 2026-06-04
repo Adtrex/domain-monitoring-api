@@ -1,6 +1,59 @@
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
+
 from django.utils import timezone
+
+# ============================================
+# REPORTING SUMMARY MODEL
+# ============================================
+class ReportSummary(models.Model):
+    """Domain/asset/scan scoped security summary export record"""
+    organization_name = models.CharField(max_length=255)
+    domain = models.ForeignKey('Domain', on_delete=models.CASCADE, related_name='report_summaries')
+    asset = models.ForeignKey('Asset', on_delete=models.SET_NULL, related_name='report_summaries', null=True, blank=True)
+    scan = models.ForeignKey('Scan', on_delete=models.SET_NULL, related_name='report_summaries', null=True, blank=True)
+    generated_at = models.DateTimeField(default=timezone.now)
+    executive_summary = models.TextField(blank=True)
+    scope_note = models.CharField(max_length=500, blank=True)
+    total_findings = models.IntegerField(default=0)
+    critical_risk = models.IntegerField(default=0)
+    high_risk = models.IntegerField(default=0)
+    medium_risk = models.IntegerField(default=0)
+    low_risk = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'report_summary'
+        ordering = ['-generated_at']
+
+    def __str__(self):
+        scope = self.asset.value if self.asset else self.domain.root_domain
+        return f"{self.organization_name} - {scope}"
+
+
+class ReportSummaryFinding(models.Model):
+    """Concise summary finding with external reference link"""
+    SEVERITY_CHOICES = [
+        ('Critical', 'Critical'),
+        ('High', 'High'),
+        ('Medium', 'Medium'),
+        ('Low', 'Low'),
+    ]
+
+    summary = models.ForeignKey(ReportSummary, on_delete=models.CASCADE, related_name='findings')
+    finding_type = models.CharField(max_length=80)
+    title = models.CharField(max_length=300)
+    severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES)
+    risk_summary = models.CharField(max_length=400)
+    external_reference = models.URLField()
+    affected_asset = models.CharField(max_length=500)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'report_summary_finding'
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.title} ({self.severity})"
 
 
 # ============================================
@@ -80,6 +133,7 @@ class Scan(models.Model):
         ('running', 'Running'),
         ('completed', 'Completed'),
         ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
     ]
     
     initiated_by = models.IntegerField(blank=True, null=True)  # User ID placeholder
@@ -89,6 +143,7 @@ class Scan(models.Model):
     finished_at = models.DateTimeField(blank=True, null=True)
     duration_seconds = models.IntegerField(blank=True, null=True)
     error_message = models.TextField(blank=True, null=True)
+    cancel_requested = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:

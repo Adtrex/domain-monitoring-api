@@ -1,10 +1,28 @@
 from rest_framework import serializers
+
 from .models import TechnologyCheck
 from .models import (
     Domain, Asset, Scan, ScanAsset, Finding, ScanFinding, CVE, FindingCVE,
     FrontendLibraryCheck, SSLTLSCheck, EmailSecurityCheck, 
-    SecurityHeaderCheck, DNSSecurityCheck
+    SecurityHeaderCheck, DNSSecurityCheck, ReportSummary, ReportSummaryFinding
 )
+# ============================================
+# DOMAIN & ASSET SERIALIZERS
+# ============================================
+
+# ============================================
+# REPORT SUMMARY SERIALIZER
+# ============================================
+class ReportSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReportSummary
+        fields = '__all__'
+
+
+class ReportSummaryFindingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReportSummaryFinding
+        fields = '__all__'
 
 
 # ============================================
@@ -33,7 +51,7 @@ class ScanListSerializer(serializers.ModelSerializer):
         model = Scan
         fields = [
             'id', 'scan_type', 'status', 'started_at', 
-            'finished_at', 'duration_seconds', 'created_at'
+            'finished_at', 'duration_seconds', 'cancel_requested', 'created_at'
         ]
 
 

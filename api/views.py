@@ -2,9 +2,12 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.test import APIRequestFactory
+from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
 from django.db.models import Count, Q
+from django.db import IntegrityError
 from django.utils import timezone
 from datetime import timedelta
 import csv
@@ -24,18 +27,102 @@ warnings.simplefilter('ignore', InsecureRequestWarning)
 from .models import TechnologyCheck
 from .serializers import TechnologyCheckSerializer
 
+
 from .models import (
     Domain, Asset, Scan, ScanAsset, Finding, ScanFinding, CVE, FindingCVE,
     FrontendLibraryCheck, SSLTLSCheck, EmailSecurityCheck,
-    SecurityHeaderCheck, DNSSecurityCheck
+    SecurityHeaderCheck, DNSSecurityCheck, ReportSummary
 )
 from .serializers import (
     DomainSerializer, AssetSerializer, ScanListSerializer, ScanDetailSerializer,
     ScanCreateSerializer, FindingSerializer, FrontendLibraryCheckSerializer,
     SSLTLSCheckSerializer, EmailSecurityCheckSerializer,
     SecurityHeaderCheckSerializer, DNSSecurityCheckSerializer,
-    ScanResultSerializer, ScanSummarySerializer
+    ScanResultSerializer, ScanSummarySerializer, ReportSummarySerializer
 )
+
+# PDF/DOCX generation imports
+from io import BytesIO
+from django.views import View
+from django.http import FileResponse
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny
+import tempfile
+try:
+    from reportlab.pdfgen import canvas
+except ImportError:
+    canvas = None
+try:
+    import docx
+except ImportError:
+    docx = None
+
+
+def _domain_to_org_name(root_domain):
+    """Derive a display-friendly organisation name from a root domain label."""
+    if not root_domain:
+        return None
+    first_label = root_domain.split('.')[0]
+    # Short labels (≤6 chars) are typically acronyms → uppercase (e.g. nitda → NITDA)
+    if len(first_label) <= 6:
+        return first_label.upper()
+    return first_label.replace('-', ' ').replace('_', ' ').title()
+
+
+# ============================================
+# REPORT SUMMARY ENDPOINT
+# ============================================
+class ReportSummaryDownloadView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, format=None):
+        """
+        Download a report summary as PDF or DOCX.
+        Query params: ?id=<report_id>&format=pdf|docx
+        """
+        report_id = request.GET.get('id')
+        file_format = request.GET.get('format', 'pdf').lower()
+        summary = get_object_or_404(ReportSummary, id=report_id)
+
+        if file_format == 'pdf':
+            if not canvas:
+                return Response({'error': 'reportlab not installed'}, status=500)
+            buffer = BytesIO()
+            p = canvas.Canvas(buffer)
+            p.setFont("Helvetica", 14)
+            p.drawString(100, 800, f"Report Summary for {summary.domain}")
+            p.setFont("Helvetica", 12)
+            p.drawString(100, 780, f"Scan Date: {summary.scan_date}")
+            p.drawString(100, 760, f"Total Findings: {summary.total_findings}")
+            p.drawString(100, 740, f"High Risk: {summary.high_risk}")
+            p.drawString(100, 720, f"Medium Risk: {summary.medium_risk}")
+            p.drawString(100, 700, f"Low Risk: {summary.low_risk}")
+            if summary.notes:
+                p.drawString(100, 680, f"Notes: {summary.notes[:80]}")
+            p.showPage()
+            p.save()
+            buffer.seek(0)
+            return FileResponse(buffer, as_attachment=True, filename=f"report_summary_{summary.id}.pdf")
+
+        elif file_format == 'docx':
+            if not docx:
+                return Response({'error': 'python-docx not installed'}, status=500)
+            doc = docx.Document()
+            doc.add_heading(f"Report Summary for {summary.domain}", 0)
+            doc.add_paragraph(f"Scan Date: {summary.scan_date}")
+            doc.add_paragraph(f"Total Findings: {summary.total_findings}")
+            doc.add_paragraph(f"High Risk: {summary.high_risk}")
+            doc.add_paragraph(f"Medium Risk: {summary.medium_risk}")
+            doc.add_paragraph(f"Low Risk: {summary.low_risk}")
+            if summary.notes:
+                doc.add_paragraph(f"Notes: {summary.notes}")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
+            doc.save(tmp.name)
+            tmp.seek(0)
+            response = FileResponse(open(tmp.name, 'rb'), as_attachment=True, filename=f"report_summary_{summary.id}.docx")
+            return response
+
+        return Response({'error': 'Invalid format'}, status=400)
 
 # Import detection and scanning modules
 from .nuclei_runner import run_nuclei_scan, get_template_path
@@ -151,10 +238,309 @@ def _validate_assets_are_active(assets) -> List[Dict[str, Any]]:
     return inactive_assets
 
 
+def _split_active_assets(assets):
+    """Split assets into active and inactive buckets based on reachability checks."""
+    asset_list = list(assets)
+    inactive_assets = _validate_assets_are_active(asset_list)
+    inactive_ids = {item['asset_id'] for item in inactive_assets}
+    active_assets = [asset for asset in asset_list if asset.id not in inactive_ids]
+    return active_assets, inactive_assets
+
+
+def _asset_value_candidates(raw_value: str) -> List[str]:
+    """Build normalized value candidates used to match existing assets."""
+    value = (raw_value or '').strip()
+    if not value:
+        return []
+
+    candidates = set()
+    candidates.add(value.lower())
+    candidates.add(value.rstrip('/').lower())
+
+    parsed = urlparse(value if value.startswith(('http://', 'https://')) else f'https://{value}')
+    host = (parsed.netloc or parsed.path or '').strip().lower().rstrip('/')
+    path = (parsed.path or '').strip().rstrip('/')
+
+    if host:
+        candidates.add(host)
+        # Always include both URL-prefixed and bare-domain forms so the lookup
+        # matches regardless of how the value was originally stored.
+        candidates.add(f'https://{host}')
+        candidates.add(f'http://{host}')
+        if host.startswith('www.'):
+            bare = host[4:]
+            candidates.add(bare)
+            candidates.add(f'https://{bare}')
+            candidates.add(f'http://{bare}')
+
+        if path and path != '/':
+            candidates.add(f"{host}{path}".lower())
+            candidates.add(f"https://{host}{path}".lower())
+            candidates.add(f"http://{host}{path}".lower())
+            if host.startswith('www.'):
+                candidates.add(f"{host[4:]}{path}".lower())
+                candidates.add(f"https://{host[4:]}{path}".lower())
+
+    return [candidate for candidate in candidates if candidate]
+
+
 class StandardPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+
+# ============================================
+# SUBDOMAIN DISCOVERY
+# ============================================
+
+_DISCOVERY_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (domainscan subdomain-discovery)',
+    'Accept': 'application/json, text/plain, */*',
+}
+
+
+def _clean_host(raw: str, root_lower: str) -> str:
+    """Normalise a candidate hostname; return '' if it should be discarded."""
+    if not raw:
+        return ''
+    h = raw.strip().lower().lstrip('*.').rstrip('.')
+    if '://' in h:
+        h = h.split('://', 1)[1]
+    h = h.split('/', 1)[0].split(':', 1)[0]
+    if not h or h == root_lower:
+        return ''
+    if not h.endswith('.' + root_lower):
+        return ''
+    if any(c in h for c in (' ', '@', '?', '#', ',')):
+        return ''
+    return h
+
+
+# --- Individual sources. Each returns a list of hostnames or [] on any error. ---
+
+def _src_sublist3r(root_domain: str) -> List[str]:
+    try:
+        import sublist3r
+        return sublist3r.main(
+            domain=root_domain, threads=40, savefile=None, ports=None,
+            silent=True, verbose=False, enable_bruteforce=False, engines=None,
+        ) or []
+    except Exception as exc:
+        logging.warning("sublist3r failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_crtsh(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://crt.sh/?q=%25.{root_domain}&output=json",
+            headers=_DISCOVERY_HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        out = []
+        for entry in r.json():
+            for h in (entry.get('name_value') or '').splitlines():
+                out.append(h)
+        return out
+    except Exception as exc:
+        logging.warning("crt.sh failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_certspotter(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://api.certspotter.com/v1/issuances",
+            params={
+                'domain': root_domain,
+                'include_subdomains': 'true',
+                'expand': 'dns_names',
+            },
+            headers=_DISCOVERY_HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        out = []
+        for entry in r.json():
+            for h in entry.get('dns_names') or []:
+                out.append(h)
+        return out
+    except Exception as exc:
+        logging.warning("certspotter failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_hackertarget(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://api.hackertarget.com/hostsearch/?q={root_domain}",
+            headers=_DISCOVERY_HEADERS, timeout=15,
+        )
+        r.raise_for_status()
+        text = r.text or ''
+        if 'API count exceeded' in text or 'error' in text.lower()[:30]:
+            return []
+        # CSV: host,ip
+        return [line.split(',', 1)[0] for line in text.splitlines() if line.strip()]
+    except Exception as exc:
+        logging.warning("hackertarget failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_alienvault(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{root_domain}/passive_dns",
+            headers=_DISCOVERY_HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+        return [rec.get('hostname', '') for rec in (data.get('passive_dns') or [])]
+    except Exception as exc:
+        logging.warning("alienvault failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_anubis(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://jldc.me/anubis/subdomains/{root_domain}",
+            headers=_DISCOVERY_HEADERS, timeout=15,
+        )
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as exc:
+        logging.warning("anubis failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_urlscan(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            f"https://urlscan.io/api/v1/search/",
+            params={'q': f'domain:{root_domain}', 'size': 10000},
+            headers=_DISCOVERY_HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        out = []
+        for res in (r.json() or {}).get('results') or []:
+            host = ((res.get('page') or {}).get('domain') or '')
+            if host:
+                out.append(host)
+            task_url = ((res.get('task') or {}).get('url') or '')
+            if task_url:
+                out.append(task_url)
+        return out
+    except Exception as exc:
+        logging.warning("urlscan failed for %s: %s", root_domain, exc)
+        return []
+
+
+def _src_wayback(root_domain: str) -> List[str]:
+    try:
+        r = requests.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params={
+                'url': f'*.{root_domain}/*',
+                'output': 'json',
+                'fl': 'original',
+                'collapse': 'urlkey',
+                'limit': 10000,
+            },
+            headers=_DISCOVERY_HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        rows = r.json() or []
+        # first row is a header
+        return [row[0] for row in rows[1:] if row]
+    except Exception as exc:
+        logging.warning("wayback failed for %s: %s", root_domain, exc)
+        return []
+
+
+_DISCOVERY_SOURCES = [
+    ('sublist3r', _src_sublist3r),
+    ('crt.sh', _src_crtsh),
+    ('certspotter', _src_certspotter),
+    ('hackertarget', _src_hackertarget),
+    ('alienvault', _src_alienvault),
+    ('anubis', _src_anubis),
+    ('urlscan', _src_urlscan),
+    ('wayback', _src_wayback),
+]
+
+
+def _discover_subdomains_aggregate(root_domain: str) -> Dict[str, Dict[str, Any]]:
+    """Query every passive source in parallel, merge & dedupe. Returns a dict:
+    {hostname: {'sources': ['crt.sh', 'sublist3r', ...]}}. Sources that fail
+    are silently skipped — having 8 means losing one or two is harmless."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    root_lower = root_domain.lower().rstrip('.')
+    aggregated: Dict[str, Dict[str, Any]] = {}
+
+    with ThreadPoolExecutor(max_workers=len(_DISCOVERY_SOURCES)) as pool:
+        futures = {pool.submit(fn, root_domain): name for name, fn in _DISCOVERY_SOURCES}
+        for fut in as_completed(futures):
+            source_name = futures[fut]
+            try:
+                hosts = fut.result() or []
+            except Exception as exc:
+                logging.warning("source %s raised: %s", source_name, exc)
+                continue
+            for raw in hosts:
+                host = _clean_host(raw, root_lower)
+                if not host:
+                    continue
+                if host not in aggregated:
+                    aggregated[host] = {'sources': []}
+                if source_name not in aggregated[host]['sources']:
+                    aggregated[host]['sources'].append(source_name)
+    return aggregated
+
+
+def _resolve_host_active(host: str, timeout: float = 3.0):
+    """Return the resolved IPv4 address if the host has an A record, else None."""
+    socket.setdefaulttimeout(timeout)
+    try:
+        ip = socket.gethostbyname(host)
+        return ip
+    except (socket.gaierror, socket.timeout, OSError):
+        return None
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+def discover_active_subdomains(root_domain: str, max_hosts: int = 2000,
+                                 resolve_workers: int = 64, timeout: float = 3.0):
+    """Discover candidates via 8 parallel passive sources (Sublist3r + 7 online
+    APIs), DNS-resolve in parallel, return only the ones with an A record.
+    Each entry: {'value': host, 'ip_address': ip, 'source': 'a,b,c'} where
+    'source' is a comma-separated list of every aggregator that saw the host."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    aggregated = _discover_subdomains_aggregate(root_domain)
+    if not aggregated:
+        return []
+
+    # Cap to avoid blasting DNS resolver on huge result sets.
+    candidates = sorted(aggregated.keys())[:max_hosts]
+
+    active = []
+    with ThreadPoolExecutor(max_workers=resolve_workers) as pool:
+        futures = {pool.submit(_resolve_host_active, h, timeout): h for h in candidates}
+        for fut in as_completed(futures):
+            host = futures[fut]
+            ip = fut.result()
+            if ip:
+                src_list = aggregated[host]['sources']
+                active.append({
+                    'value': host,
+                    'ip_address': ip,
+                    'source': ','.join(sorted(src_list)),
+                })
+    active.sort(key=lambda x: x['value'])
+    return active
 
 
 # ============================================
@@ -169,6 +555,265 @@ class DomainViewSet(viewsets.ModelViewSet):
     serializer_class = DomainSerializer
     pagination_class = StandardPagination
 
+    @action(detail=True, methods=['post'], url_path='discover-subdomains')
+    def discover_subdomains(self, request, pk=None):
+        """Discover active subdomains for a domain and auto-populate assets.
+
+        POST /api/domains/{id}/discover-subdomains/
+
+        Optional JSON body:
+          {
+            "max_hosts": 500,        # cap candidates from crt.sh (default 500)
+            "resolve_timeout": 3.0,  # per-host DNS timeout in seconds (default 3.0)
+            "dry_run": false         # if true, just return discovery without DB writes
+          }
+
+        Returns:
+          {
+            "domain": "<root_domain>",
+            "candidates_found": <int>,   # total from crt.sh after dedupe
+            "active": <int>,             # number with an A record
+            "created": <int>,            # new Asset rows inserted
+            "skipped_existing": <int>,   # already in Asset table
+            "subdomains": [
+              {"value": "...", "ip_address": "...", "source": "crt.sh", "created": true/false}
+            ]
+          }
+        """
+        domain = self.get_object()
+        body = request.data if isinstance(request.data, dict) else {}
+        max_hosts = int(body.get('max_hosts') or 500)
+        resolve_timeout = float(body.get('resolve_timeout') or 3.0)
+        dry_run = bool(body.get('dry_run'))
+
+        active = discover_active_subdomains(
+            domain.root_domain,
+            max_hosts=max_hosts,
+            timeout=resolve_timeout,
+        )
+
+        existing = set(
+            domain.assets.filter(asset_type='subdomain')
+            .values_list('value', flat=True)
+        )
+
+        results = []
+        created_count = 0
+        skipped = 0
+        for entry in active:
+            host = entry['value']
+            already = host in existing
+            if already:
+                skipped += 1
+            elif not dry_run:
+                try:
+                    Asset.objects.create(
+                        domain=domain,
+                        asset_type='subdomain',
+                        value=host,
+                        source=entry['source'],
+                        ip_address=entry['ip_address'],
+                        last_verified=timezone.now(),
+                    )
+                    created_count += 1
+                except IntegrityError:
+                    skipped += 1
+                    already = True
+            results.append({
+                'value': host,
+                'ip_address': entry['ip_address'],
+                'source': entry['source'],
+                'created': not already and not dry_run,
+            })
+
+        return Response({
+            'domain': domain.root_domain,
+            'candidates_found': len(active),
+            'active': len(active),
+            'created': created_count,
+            'skipped_existing': skipped,
+            'dry_run': dry_run,
+            'subdomains': results,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['get'])
+    def posture(self, request, pk=None):
+        """
+        Get comprehensive security posture for a domain
+        GET /api/domains/{id}/posture/
+        
+        Returns:
+        - Domain info
+        - Latest scan summary
+        - Issues/findings organized by severity and category
+        - Email, SSL, DNS, Headers status across all assets
+        - List of scanned assets
+        """
+        domain = self.get_object()
+        
+        # Get the latest scan for this domain (across all its assets)
+        latest_scan = Scan.objects.filter(
+            scan_assets__asset__domain=domain,
+            status='completed'
+        ).order_by('-finished_at').first()
+        
+        if not latest_scan:
+            return Response({
+                'domain_id': domain.id,
+                'domain': domain.root_domain,
+                'status': 'no_scans',
+                'message': 'No completed scans found for this domain',
+                'last_scan_at': None,
+                'last_scan_date': None,
+                'last_scan_time': None,
+                'assets': []
+            }, status=status.HTTP_200_OK)
+        
+        # Get all assets under this domain
+        assets = domain.assets.all()
+        
+        # Collect all findings for this domain from the latest scan
+        findings = Finding.objects.filter(
+            asset__domain=domain,
+            finding_scans__scan=latest_scan
+        ).select_related('asset')
+        
+        # Aggregate statistics
+        finding_counts = {
+            'total': findings.count(),
+            'critical': findings.filter(risk_rating='Critical').count(),
+            'high': findings.filter(risk_rating='High').count(),
+            'medium': findings.filter(risk_rating='Medium').count(),
+            'low': findings.filter(risk_rating='Low').count(),
+        }
+        
+        # Group findings by category and severity
+        findings_by_category = {}
+        for category in ['SSL', 'DNS', 'Email', 'CVE', 'Misconfiguration']:
+            category_findings = findings.filter(category=category)
+            if category_findings.exists():
+                findings_by_category[category] = {
+                    'count': category_findings.count(),
+                    'by_severity': {
+                        'critical': category_findings.filter(risk_rating='Critical').count(),
+                        'high': category_findings.filter(risk_rating='High').count(),
+                        'medium': category_findings.filter(risk_rating='Medium').count(),
+                        'low': category_findings.filter(risk_rating='Low').count(),
+                    },
+                    'issues': FindingSerializer(
+                        category_findings[:10],  # Limit to top 10 per category
+                        many=True
+                    ).data
+                }
+        
+        # Get email security checks status
+        email_checks = EmailSecurityCheck.objects.filter(
+            asset__domain=domain,
+            scan=latest_scan
+        )
+        email_status = {
+            'spf': self._get_email_status(email_checks, 'SPF'),
+            'dkim': self._get_email_status(email_checks, 'DKIM'),
+            'dmarc': self._get_email_status(email_checks, 'DMARC'),
+            'total_checks': email_checks.count()
+        }
+        
+        # Get SSL checks status
+        ssl_checks = SSLTLSCheck.objects.filter(
+            asset__domain=domain,
+            scan=latest_scan
+        )
+        ssl_passed = ssl_checks.filter(risk_rating='Low').count()
+        ssl_failed = ssl_checks.exclude(risk_rating='Low').count()
+        ssl_status = {
+            'passed': ssl_passed,
+            'failed': ssl_failed,
+            'score': 100 if not ssl_checks else round(100 * (ssl_passed / ssl_checks.count())),
+            'total_checks': ssl_checks.count()
+        }
+        
+        # Get DNS checks status
+        dns_checks = DNSSecurityCheck.objects.filter(
+            asset__domain=domain,
+            scan=latest_scan
+        )
+        dns_status = {
+            'total_checks': dns_checks.count(),
+            'issues': dns_checks.exclude(risk_rating='Low').count()
+        }
+        
+        # Get security headers status
+        header_checks = SecurityHeaderCheck.objects.filter(
+            asset__domain=domain,
+            scan=latest_scan
+        )
+        headers_present = header_checks.filter(status='present').count()
+        headers_missing = header_checks.filter(status='missing').count()
+        header_status = {
+            'present': headers_present,
+            'missing': headers_missing,
+            'total': header_checks.count()
+        }
+        
+        # Get library checks status
+        library_checks = FrontendLibraryCheck.objects.filter(
+            asset__domain=domain,
+            scan=latest_scan
+        )
+        library_status = {
+            'up_to_date': library_checks.filter(vulnerability_status='up-to-date').count(),
+            'outdated': library_checks.filter(vulnerability_status='outdated').count(),
+            'vulnerable': library_checks.filter(vulnerability_status='vulnerable').count(),
+            'total': library_checks.count()
+        }
+        
+        # Determine overall risk rating
+        risk_ratings = [f.risk_rating for f in findings]
+        risk_priority = {'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3}
+        overall_risk = min(risk_ratings, key=lambda x: risk_priority.get(x, 999)) if risk_ratings else 'Low'
+
+        # Use a safe fallback in case finished_at is not populated for historical scans.
+        last_scan_at = latest_scan.finished_at or latest_scan.started_at or latest_scan.created_at
+        last_scan_date = last_scan_at.date().isoformat() if last_scan_at else None
+        last_scan_time = last_scan_at.time().replace(microsecond=0).isoformat() if last_scan_at else None
+        
+        posture_data = {
+            'domain_id': domain.id,
+            'domain': domain.root_domain,
+            'status': latest_scan.status,
+            'last_scan': last_scan_at,
+            'last_scan_at': last_scan_at,
+            'last_scan_date': last_scan_date,
+            'last_scan_time': last_scan_time,
+            'scan_duration_seconds': latest_scan.duration_seconds,
+            'overall_risk_rating': overall_risk,
+            'findings_summary': finding_counts,
+            'findings_by_category': findings_by_category,
+            'email_security': email_status,
+            'ssl_tls': ssl_status,
+            'dns_security': dns_status,
+            'security_headers': header_status,
+            'frontend_libraries': library_status,
+            'assets_scanned': [
+                {
+                    'id': asset.id,
+                    'value': asset.value,
+                    'type': asset.asset_type,
+                    'issues_found': findings.filter(asset=asset).count()
+                }
+                for asset in assets
+            ]
+        }
+        
+        return Response(posture_data, status=status.HTTP_200_OK)
+    
+    def _get_email_status(self, checks, check_type):
+        """Helper to get email check status"""
+        check = checks.filter(check_type=check_type).first()
+        if not check:
+            return 'not_checked'
+        return check.status.lower() if check.status else 'unknown'
+
 
 class AssetViewSet(viewsets.ModelViewSet):
     """
@@ -177,6 +822,51 @@ class AssetViewSet(viewsets.ModelViewSet):
     queryset = Asset.objects.all()
     serializer_class = AssetSerializer
     pagination_class = StandardPagination
+
+    def get_queryset(self):
+        """Filter assets in the database by domain when requested."""
+        queryset = super().get_queryset().select_related('domain')
+
+        domain = self.request.GET.get('domain') or self.request.GET.get('domain_id')
+        if domain:
+            if not str(domain).isdigit():
+                raise ValidationError({'domain': 'domain must be a numeric id'})
+            queryset = queryset.filter(domain_id=int(domain))
+
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Create an asset, but reuse an existing one if it already exists for the domain."""
+        domain_id = request.data.get('domain')
+        raw_value = request.data.get('value', '')
+
+        if domain_id and raw_value:
+            candidates = _asset_value_candidates(raw_value)
+            if candidates:
+                query = Q()
+                for candidate in candidates:
+                    query |= Q(value__iexact=candidate)
+
+                existing = Asset.objects.filter(domain_id=domain_id).filter(query).order_by('id').first()
+                if existing:
+                    serializer = self.get_serializer(existing)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+
+        try:
+            return super().create(request, *args, **kwargs)
+        except IntegrityError:
+            # Race condition: another request created the same asset between our
+            # check above and this insert. Return the row that won the race.
+            if domain_id and raw_value:
+                candidates = _asset_value_candidates(raw_value)
+                query = Q()
+                for candidate in candidates:
+                    query |= Q(value__iexact=candidate)
+                existing = Asset.objects.filter(domain_id=domain_id).filter(query).order_by('id').first()
+                if existing:
+                    serializer = self.get_serializer(existing)
+                    return Response(serializer.data, status=status.HTTP_200_OK)
+            raise
 
 
 # ============================================
@@ -197,17 +887,21 @@ class ScanViewSet(viewsets.ModelViewSet):
         queryset = super().get_queryset()
         
         # Filter by domain_id: returns scans that scanned assets belonging to this domain
-        domain_id = self.request.GET.get('domain_id')
+        domain_id = self.request.GET.get('domain_id') or self.request.GET.get('domain')
         if domain_id:
+            if not str(domain_id).isdigit():
+                raise ValidationError({'domain_id': 'domain_id must be a numeric id'})
             queryset = queryset.filter(
-                scan_assets__asset__domain_id=domain_id
+                scan_assets__asset__domain_id=int(domain_id)
             ).distinct()
         
         # Filter by asset_id: returns scans that scanned this specific asset
         asset_id = self.request.GET.get('asset_id')
         if asset_id:
+            if not str(asset_id).isdigit():
+                raise ValidationError({'asset_id': 'asset_id must be a numeric id'})
             queryset = queryset.filter(
-                scan_assets__asset_id=asset_id
+                scan_assets__asset_id=int(asset_id)
             ).distinct()
         
         return queryset
@@ -261,35 +955,72 @@ class ScanViewSet(viewsets.ModelViewSet):
             ScanDetailSerializer(scan).data,
             status=status.HTTP_201_CREATED
         )
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """
+        Request cancellation for a queued/running scan.
+        POST /api/scans/{id}/cancel/
+        """
+        scan = self.get_object()
+
+        if scan.status in ['completed', 'failed', 'cancelled']:
+            return Response(
+                {
+                    'error': f"Cannot cancel scan with status: {scan.status}",
+                    'scan_id': scan.id,
+                    'status': scan.status,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        scan.cancel_requested = True
+
+        # If not running yet, mark immediately as cancelled.
+        if scan.status == 'queued':
+            now = timezone.now()
+            scan.status = 'cancelled'
+            scan.finished_at = now
+            if scan.started_at:
+                scan.duration_seconds = int((now - scan.started_at).total_seconds())
+            else:
+                scan.duration_seconds = 0
+            scan.error_message = 'Cancelled by user before execution started.'
+
+        scan.save()
+
+        return Response(
+            {
+                'message': 'Cancellation requested successfully.',
+                'scan_id': scan.id,
+                'status': scan.status,
+                'effective_status': 'cancelling' if scan.status == 'running' else scan.status,
+                'cancel_requested': scan.cancel_requested,
+            },
+            status=status.HTTP_200_OK,
+        )
     
     @action(detail=True, methods=['get'])
     def summary(self, request, pk=None):
         """
-        Get summary statistics for a scan
+        Get summary statistics for a scan using the single source of truth
         GET /api/scans/{id}/summary/
         """
+        from .findings_aggregation import get_normalized_findings_and_counts
         scan = self.get_object()
-        
-        # Calculate summary statistics
+        scan_assets = scan.scan_assets.select_related('asset', 'asset__domain')
+        domain_obj = scan_assets[0].asset.domain if scan_assets else None
+        asset_obj = None
+        findings, summary_counts, summary_total = get_normalized_findings_and_counts(domain_obj, asset_obj, scan)
+
         summary_data = {
             'scan_id': scan.id,
             'total_assets_scanned': scan.scan_assets.count(),
-            
-            # Finding counts by severity
-            'total_findings': ScanFinding.objects.filter(scan=scan).count(),
-            'critical_findings': ScanFinding.objects.filter(
-                scan=scan, finding__risk_rating='Critical'
-            ).count(),
-            'high_findings': ScanFinding.objects.filter(
-                scan=scan, finding__risk_rating='High'
-            ).count(),
-            'medium_findings': ScanFinding.objects.filter(
-                scan=scan, finding__risk_rating='Medium'
-            ).count(),
-            'low_findings': ScanFinding.objects.filter(
-                scan=scan, finding__risk_rating='Low'
-            ).count(),
-            
+            'total_findings': summary_total,
+            'critical_findings': summary_counts.get('Critical', 0),
+            'high_findings': summary_counts.get('High', 0),
+            'medium_findings': summary_counts.get('Medium', 0),
+            'low_findings': summary_counts.get('Low', 0),
             # Check type counts
             'library_checks_count': scan.library_checks.count(),
             'ssl_checks_count': scan.ssl_checks.count(),
@@ -297,7 +1028,6 @@ class ScanViewSet(viewsets.ModelViewSet):
             'header_checks_count': scan.header_checks.count(),
             'dns_checks_count': scan.dns_checks.count(),
             'technology_checks_count': scan.technology_checks.count(),
-            
             # Library statistics
             'libraries_up_to_date': scan.library_checks.filter(
                 vulnerability_status='up-to-date'
@@ -308,12 +1038,10 @@ class ScanViewSet(viewsets.ModelViewSet):
             'libraries_vulnerable': scan.library_checks.filter(
                 vulnerability_status='vulnerable'
             ).count(),
-            
             # Email security status
             'spf_status': self._get_email_check_status(scan, 'SPF'),
             'dkim_status': self._get_email_check_status(scan, 'DKIM'),
             'dmarc_status': self._get_email_check_status(scan, 'DMARC'),
-            
             # SSL statistics
             'ssl_issues_found': scan.ssl_checks.filter(
                 cvss_score__gte=4.0
@@ -326,12 +1054,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                 check_type='certificate',
                 certificate_days_remaining__lte=30
             ).exists(),
-            
             # Header statistics
             'missing_headers': scan.header_checks.filter(status='missing').count(),
             'present_headers': scan.header_checks.filter(status='present').count(),
         }
-        
         serializer = ScanSummarySerializer(summary_data)
         return Response(serializer.data)
     
@@ -340,16 +1066,24 @@ class ScanViewSet(viewsets.ModelViewSet):
         check = scan.email_checks.filter(check_type=check_type).first()
         return check.status if check else 'NOT_CHECKED'
 
-    def _build_scan_report_payload(self, scan):
-        """Build normalized report payload for export/download."""
-        scan_assets = ScanAsset.objects.filter(scan=scan).select_related('asset', 'asset__domain')
-        findings_qs = ScanFinding.objects.filter(
-            scan=scan
-        ).select_related(
-            'finding', 'finding__asset', 'finding__asset__domain'
-        ).prefetch_related(
-            'finding__finding_cves__cve'
-        )
+    def _build_scan_report_payload(self, scan, domain_name=None):
+        """Build normalized report payload for export/download using single source of truth."""
+        from .findings_aggregation import get_normalized_findings_and_counts
+        # Get domain and asset context from scan, optionally scoped to a single domain.
+        scan_assets_qs = ScanAsset.objects.filter(scan=scan).select_related('asset', 'asset__domain')
+        if domain_name:
+            scan_assets_qs = scan_assets_qs.filter(asset__domain__root_domain__iexact=domain_name)
+
+        scan_assets = list(scan_assets_qs)
+        if domain_name and not scan_assets:
+            raise ValueError(
+                f"Domain '{domain_name}' is not part of scan {scan.id}"
+            )
+
+        domain_obj = scan_assets[0].asset.domain if scan_assets else None
+        asset_obj = None  # For full scan, not asset-specific
+        # Get findings, counts, total
+        findings, summary_counts, summary_total = get_normalized_findings_and_counts(domain_obj, asset_obj, scan)
 
         assets = [
             {
@@ -360,6 +1094,22 @@ class ScanViewSet(viewsets.ModelViewSet):
             }
             for item in scan_assets
         ]
+
+        # Keep checks for compatibility
+        library_checks_qs = scan.library_checks.select_related('asset').all()
+        technology_checks_qs = scan.technology_checks.select_related('asset').all()
+        ssl_checks_qs = scan.ssl_checks.select_related('asset').all()
+        email_checks_qs = scan.email_checks.select_related('asset').all()
+        header_checks_qs = scan.header_checks.select_related('asset').all()
+        dns_checks_qs = scan.dns_checks.select_related('asset').all()
+
+        if domain_obj:
+            library_checks_qs = library_checks_qs.filter(asset__domain=domain_obj)
+            technology_checks_qs = technology_checks_qs.filter(asset__domain=domain_obj)
+            ssl_checks_qs = ssl_checks_qs.filter(asset__domain=domain_obj)
+            email_checks_qs = email_checks_qs.filter(asset__domain=domain_obj)
+            header_checks_qs = header_checks_qs.filter(asset__domain=domain_obj)
+            dns_checks_qs = dns_checks_qs.filter(asset__domain=domain_obj)
 
         library_checks = [
             {
@@ -372,7 +1122,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'recommendation': item.recommendation,
                 'checked_at': item.checked_at,
             }
-            for item in scan.library_checks.select_related('asset').all().order_by('library_name', 'id')
+            for item in library_checks_qs.order_by('library_name', 'id')
         ]
         technology_checks = [
             {
@@ -384,7 +1134,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'asset': item.asset.value if item.asset else None,
                 'checked_at': item.created_at,
             }
-            for item in scan.technology_checks.select_related('asset').all().order_by('category', 'technology_name', 'id')
+            for item in technology_checks_qs.order_by('category', 'technology_name', 'id')
         ]
         ssl_checks = [
             {
@@ -397,7 +1147,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'recommendation': item.recommendation,
                 'checked_at': item.checked_at,
             }
-            for item in scan.ssl_checks.select_related('asset').all().order_by('check_type', 'id')
+            for item in ssl_checks_qs.order_by('check_type', 'id')
         ]
         email_checks = [
             {
@@ -410,7 +1160,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'recommendation': item.recommendation,
                 'checked_at': item.checked_at,
             }
-            for item in scan.email_checks.select_related('asset').all().order_by('check_type', 'id')
+            for item in email_checks_qs.order_by('check_type', 'id')
         ]
         header_checks = [
             {
@@ -423,7 +1173,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'recommendation': item.recommendation,
                 'checked_at': item.checked_at,
             }
-            for item in scan.header_checks.select_related('asset').all().order_by('header', 'id')
+            for item in header_checks_qs.order_by('header', 'id')
         ]
         dns_checks = [
             {
@@ -436,36 +1186,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                 'recommendation': item.recommendation,
                 'checked_at': item.checked_at,
             }
-            for item in scan.dns_checks.select_related('asset').all().order_by('check_type', 'id')
+            for item in dns_checks_qs.order_by('check_type', 'id')
         ]
 
-        findings = []
-        for item in findings_qs:
-            finding = item.finding
-            cve_ids = [
-                link.cve.cve_id
-                for link in finding.finding_cves.all()
-                if link.cve_id
-            ]
-
-            findings.append(
-                {
-                    'id': finding.id,
-                    'title': finding.title,
-                    'category': finding.category,
-                    'risk_rating': finding.risk_rating,
-                    'status': finding.status,
-                    'cvss_score': finding.cvss_score,
-                    'nuclei_template_id': finding.nuclei_template_id,
-                    'asset': finding.asset.value if finding.asset else None,
-                    'domain': finding.asset.domain.root_domain if finding.asset and finding.asset.domain else None,
-                    'recommendation': finding.recommendation,
-                    'first_seen': finding.first_seen,
-                    'last_seen': finding.last_seen,
-                    'cve_ids': cve_ids,
-                }
-            )
-
+        root_domain = domain_obj.root_domain if domain_obj else None
         summary = {
             'scan_id': scan.id,
             'scan_type': scan.scan_type,
@@ -474,17 +1198,19 @@ class ScanViewSet(viewsets.ModelViewSet):
             'finished_at': scan.finished_at,
             'duration_seconds': scan.duration_seconds,
             'total_assets_scanned': len(assets),
-            'total_findings': len(findings),
-            'critical_findings': len([f for f in findings if f['risk_rating'] == 'Critical']),
-            'high_findings': len([f for f in findings if f['risk_rating'] == 'High']),
-            'medium_findings': len([f for f in findings if f['risk_rating'] == 'Medium']),
-            'low_findings': len([f for f in findings if f['risk_rating'] == 'Low']),
-            'library_checks_count': scan.library_checks.count(),
-            'ssl_checks_count': scan.ssl_checks.count(),
-            'email_checks_count': scan.email_checks.count(),
-            'header_checks_count': scan.header_checks.count(),
-            'dns_checks_count': scan.dns_checks.count(),
-            'technology_checks_count': scan.technology_checks.count(),
+            'total_findings': summary_total,
+            'critical_findings': summary_counts.get('Critical', 0),
+            'high_findings': summary_counts.get('High', 0),
+            'medium_findings': summary_counts.get('Medium', 0),
+            'low_findings': summary_counts.get('Low', 0),
+            'library_checks_count': library_checks_qs.count(),
+            'ssl_checks_count': ssl_checks_qs.count(),
+            'email_checks_count': email_checks_qs.count(),
+            'header_checks_count': header_checks_qs.count(),
+            'dns_checks_count': dns_checks_qs.count(),
+            'technology_checks_count': technology_checks_qs.count(),
+            'domain_name': root_domain,
+            'org_name': _domain_to_org_name(root_domain),
         }
 
         return {
@@ -525,6 +1251,7 @@ class ScanViewSet(viewsets.ModelViewSet):
 
         payload = self._build_scan_report_payload(scan)
         timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+        org_slug = re.sub(r'[^\w\-]', '_', payload['summary'].get('org_name') or f'scan_{scan.id}')
 
         if report_format == 'json':
             response = HttpResponse(
@@ -532,7 +1259,7 @@ class ScanViewSet(viewsets.ModelViewSet):
                 content_type='application/json',
             )
             response['Content-Disposition'] = (
-                f'attachment; filename="scan_{scan.id}_report_{timestamp}.json"'
+                f'attachment; filename="{org_slug}_security_report_{timestamp}.json"'
             )
             return response
 
@@ -543,7 +1270,7 @@ class ScanViewSet(viewsets.ModelViewSet):
 
             response = HttpResponse(content, content_type='application/pdf')
             response['Content-Disposition'] = (
-                f'attachment; filename="scan_{scan.id}_report_{timestamp}.pdf"'
+                f'attachment; filename="{org_slug}_security_report_{timestamp}.pdf"'
             )
             return response
 
@@ -557,13 +1284,13 @@ class ScanViewSet(viewsets.ModelViewSet):
                 content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             )
             response['Content-Disposition'] = (
-                f'attachment; filename="scan_{scan.id}_report_{timestamp}.docx"'
+                f'attachment; filename="{org_slug}_security_report_{timestamp}.docx"'
             )
             return response
 
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = (
-            f'attachment; filename="scan_{scan.id}_report_{timestamp}.csv"'
+            f'attachment; filename="{org_slug}_security_report_{timestamp}.csv"'
         )
 
         writer = csv.writer(response)
@@ -625,6 +1352,30 @@ class ScanViewSet(viewsets.ModelViewSet):
         POST /api/scans/{id}/execute/
         """
         scan = self.get_object()
+
+        # Respect prior cancellation requests.
+        if scan.cancel_requested:
+            if scan.status != 'cancelled':
+                now = timezone.now()
+                scan.status = 'cancelled'
+                scan.finished_at = now
+                if scan.started_at:
+                    scan.duration_seconds = int((now - scan.started_at).total_seconds())
+                else:
+                    scan.duration_seconds = 0
+                if not scan.error_message:
+                    scan.error_message = 'Cancelled by user.'
+                scan.save()
+
+            return Response(
+                {
+                    'error': 'Scan execution cancelled before start.',
+                    'scan_id': scan.id,
+                    'status': scan.status,
+                    'cancel_requested': scan.cancel_requested,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         
         if scan.status != 'queued':
             return Response(
@@ -652,11 +1403,15 @@ class ScanViewSet(viewsets.ModelViewSet):
         scan_assets = ScanAsset.objects.filter(scan=scan).select_related('asset')
         assets = [sa.asset for sa in scan_assets]
 
-        inactive_assets = _validate_assets_are_active(assets)
+        active_assets, inactive_assets = _split_active_assets(assets)
         if inactive_assets:
-            logger.warning(f"Scan precheck failed for scan {scan.id}: {inactive_assets}")
+            logger.warning(
+                f"Scan {scan.id} precheck: skipping {len(inactive_assets)} inactive targets"
+            )
+
+        if not active_assets:
             scan.status = 'failed'
-            scan.error_message = 'One or more targets are not active/reachable. Scan aborted.'
+            scan.error_message = 'All targets are inactive/unreachable. Nothing to scan.'
             scan.finished_at = timezone.now()
             if scan.started_at:
                 scan.duration_seconds = int((scan.finished_at - scan.started_at).total_seconds())
@@ -665,22 +1420,55 @@ class ScanViewSet(viewsets.ModelViewSet):
             scan.save()
             return Response(
                 {
-                    'error': 'One or more targets are not active/reachable. Scan aborted.',
+                    'error': 'All targets are inactive/unreachable. Nothing to scan.',
                     'scan_id': scan.id,
                     'status': 'failed',
                     'inactive_targets': inactive_assets,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        if inactive_assets:
+            ScanAsset.objects.filter(scan=scan, asset_id__in=[item['asset_id'] for item in inactive_assets]).delete()
+
+        assets = active_assets
         
         # Update status
+        scan.cancel_requested = False
         scan.status = 'running'
         scan.started_at = timezone.now()
         scan.save()
+
+        def _cancel_if_requested(reason='Cancelled by user during execution.'):
+            scan.refresh_from_db(fields=['cancel_requested'])
+            if not scan.cancel_requested:
+                return None
+
+            now = timezone.now()
+            scan.status = 'cancelled'
+            scan.finished_at = now
+            if scan.started_at:
+                scan.duration_seconds = int((now - scan.started_at).total_seconds())
+            else:
+                scan.duration_seconds = 0
+            scan.error_message = reason
+            scan.save(update_fields=['status', 'finished_at', 'duration_seconds', 'error_message'])
+            return Response(
+                {
+                    'message': 'Scan cancelled successfully.',
+                    'scan_id': scan.id,
+                    'status': scan.status,
+                    'duration_seconds': scan.duration_seconds,
+                }
+            )
         
         try:
             # Execute scans for each asset
             for asset in assets:
+                cancelled = _cancel_if_requested()
+                if cancelled:
+                    return cancelled
+
                 logger.info(f"=== STARTING SCAN FOR {asset.value} ===")
                 
                 # 1. Extract organization name if requested
@@ -714,6 +1502,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                         logger.error(f"❌ Org extraction failed for {asset.value}: {e}")
                         import traceback
                         logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+                cancelled = _cancel_if_requested()
+                if cancelled:
+                    return cancelled
                 
                 # 2. Run Nuclei scan
                 logger.info(f"Running Nuclei scan on {asset.value}")
@@ -726,6 +1518,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                         logger.info(f"ℹ️ Nuclei scan skipped or returned no results (templates may be unavailable on Windows)")
                 except Exception as e:
                     logger.warning(f"⚠️ Nuclei scan failed: {e}. Continuing with other checks...")
+
+                cancelled = _cancel_if_requested()
+                if cancelled:
+                    return cancelled
                 
                 # 2.5. Check security headers directly via HTTP
                 logger.info(f"🔍 === SECURITY HEADERS CHECK STARTED ===")
@@ -745,6 +1541,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                     logger.error(f"❌ Security headers check failed: {e}")
                     import traceback
                     logger.error(f"Traceback:\n{traceback.format_exc()}")
+
+                cancelled = _cancel_if_requested()
+                if cancelled:
+                    return cancelled
                 
                 # 3. Check for libraries and CVEs
                 if check_libraries:
@@ -760,6 +1560,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                         # Detect libraries and CMS
                         logger.info(f"Calling detect_technologies for {asset_url}")
                         tech_result = detect_technologies(asset_url)
+
+                        cancelled = _cancel_if_requested()
+                        if cancelled:
+                            return cancelled
 
                         _process_technology_results(scan, asset, tech_result)
                         
@@ -778,6 +1582,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                         
                         # Process each library - NEVER SKIP!
                         for lib in detected_libraries:
+                            cancelled = _cancel_if_requested()
+                            if cancelled:
+                                return cancelled
+
                             lib_name = lib.get('name')
                             lib_version = lib.get('version', 'Unknown')  # Default to 'Unknown'
                             lib_source = lib.get('source', 'unknown')
@@ -946,6 +1754,10 @@ class ScanViewSet(viewsets.ModelViewSet):
                             
                             # Create findings for CVEs (only if vulnerabilities found)
                             for idx, vuln in enumerate(vulnerabilities, 1):
+                                cancelled = _cancel_if_requested()
+                                if cancelled:
+                                    return cancelled
+
                                 logger.info(f"\n{'='*60}")
                                 logger.info(f"Processing vulnerability {idx}/{len(vulnerabilities)} for {lib_name} v{lib_version}")
                                 
@@ -1194,16 +2006,24 @@ class ScanViewSet(viewsets.ModelViewSet):
                         import traceback
                         logger.error(f"Full traceback:\n{traceback.format_exc()}")
 
-            scan.status = 'completed'
+            scan.refresh_from_db(fields=['cancel_requested'])
             scan.finished_at = timezone.now()
             scan.duration_seconds = int((scan.finished_at - scan.started_at).total_seconds())
+            if scan.cancel_requested:
+                scan.status = 'cancelled'
+                scan.error_message = 'Cancelled by user during execution.'
+            else:
+                scan.status = 'completed'
             scan.save()
             
             return Response({
-                'message': 'Scan executed successfully',
+                'message': 'Scan executed successfully' if scan.status == 'completed' else 'Scan cancelled successfully.',
                 'scan_id': scan.id,
-                'status': 'completed',
-                'duration_seconds': scan.duration_seconds
+                'status': scan.status,
+                'duration_seconds': scan.duration_seconds,
+                'scanned_assets_count': len(assets),
+                'skipped_assets_count': len(inactive_assets),
+                'skipped_targets': inactive_assets,
             })
         
         except Exception as e:
@@ -1916,20 +2736,25 @@ def scan_findings(request, scan_id):
 
 
 @api_view(['GET'])
-def scan_report_download(request, scan_id, report_format='json'):
+def scan_report_download(request, scan_id, report_format='json', domain_name=None):
     """
     Download generated report for a scan.
     GET /api/scans/{scan_id}/report/download/{format}/
     GET /api/report/download/{scan_id}/{format}/
+    GET /api/report/download/{scan_id}/{format}/{domain_name}/
 
-    Query param format remains supported for backward compatibility.
+    Query params remain supported for backward compatibility:
+    - format
+    - domain
     """
+    domain_name = (domain_name or request.GET.get('domain') or '').strip()
     report_format = (report_format or request.GET.get('format', 'json')).lower()
     logger.info(
-        "scan_report_download called path=%s scan_id=%s format=%s",
+        "scan_report_download called path=%s scan_id=%s format=%s domain=%s",
         request.path,
         scan_id,
         report_format,
+        domain_name or None,
     )
     scan = Scan.objects.filter(id=scan_id).first()
     if not scan:
@@ -1949,7 +2774,16 @@ def scan_report_download(request, scan_id, report_format='json'):
         )
 
     try:
-        payload = helper._build_scan_report_payload(scan)
+        payload = helper._build_scan_report_payload(scan, domain_name=domain_name or None)
+    except ValueError as exc:
+        return Response(
+            {
+                'error': str(exc),
+                'scan_id': scan_id,
+                'domain': domain_name or None,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     except Exception as exc:
         logger.exception("Failed to build report payload for scan_id=%s", scan_id)
         return Response(
@@ -1961,6 +2795,7 @@ def scan_report_download(request, scan_id, report_format='json'):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
     timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+    org_slug = re.sub(r'[^\w\-]', '_', payload['summary'].get('org_name') or f'scan_{scan.id}')
 
     if report_format == 'json':
         response = HttpResponse(
@@ -1968,7 +2803,7 @@ def scan_report_download(request, scan_id, report_format='json'):
             content_type='application/json',
         )
         response['Content-Disposition'] = (
-            f'attachment; filename="scan_{scan.id}_report_{timestamp}.json"'
+            f'attachment; filename="{org_slug}_security_report_{timestamp}.json"'
         )
         return response
 
@@ -1979,7 +2814,7 @@ def scan_report_download(request, scan_id, report_format='json'):
 
         response = HttpResponse(content, content_type='application/pdf')
         response['Content-Disposition'] = (
-            f'attachment; filename="scan_{scan.id}_report_{timestamp}.pdf"'
+            f'attachment; filename="{org_slug}_security_report_{timestamp}.pdf"'
         )
         return response
 
@@ -1993,13 +2828,13 @@ def scan_report_download(request, scan_id, report_format='json'):
             content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
         response['Content-Disposition'] = (
-            f'attachment; filename="scan_{scan.id}_report_{timestamp}.docx"'
+            f'attachment; filename="{org_slug}_security_report_{timestamp}.docx"'
         )
         return response
 
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = (
-        f'attachment; filename="scan_{scan.id}_report_{timestamp}.csv"'
+        f'attachment; filename="{org_slug}_security_report_{timestamp}.csv"'
     )
 
     writer = csv.writer(response)
@@ -2322,16 +3157,22 @@ def execute_nuclei_scan(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    inactive_assets = _validate_assets_are_active(assets)
+    active_assets, inactive_assets = _split_active_assets(assets)
     if inactive_assets:
-        logger.warning(f"On-demand scan precheck failed: {inactive_assets}")
+        logger.warning(
+            f"On-demand scan precheck: skipping {len(inactive_assets)} inactive targets"
+        )
+
+    if not active_assets:
         return Response(
             {
-                'error': 'One or more targets are not active/reachable. Scan aborted.',
+                'error': 'All targets are inactive/unreachable. Nothing to scan.',
                 'inactive_targets': inactive_assets,
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    assets = active_assets
     
     # Create scan record
     scan = Scan.objects.create(
@@ -2891,7 +3732,10 @@ def execute_nuclei_scan(request):
             'message': 'Scan completed successfully',
             'scan_id': scan.id,
             'status': 'completed',
-            'duration_seconds': scan.duration_seconds
+            'duration_seconds': scan.duration_seconds,
+            'scanned_assets_count': len(assets),
+            'skipped_assets_count': len(inactive_assets),
+            'skipped_targets': inactive_assets,
         })
         
     except Exception as e:
@@ -2908,6 +3752,46 @@ def execute_nuclei_scan(request):
             {'error': f'Scan failed: {str(e)}'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
+@api_view(['POST'])
+def execute_domain_scan(request, domain_id):
+    """
+    Execute scan for all assets under a domain in one request.
+
+    POST /api/domains/{domain_id}/scan/
+    Body (optional):
+    {
+        "templates": ["ssl", "dns", "email"],
+        "scan_type": "on-demand",
+        "check_libraries": true,
+        "check_cves": true,
+        "extract_org": true
+    }
+    """
+    domain = get_object_or_404(Domain, id=domain_id)
+    asset_ids = list(domain.assets.values_list('id', flat=True))
+
+    if not asset_ids:
+        return Response(
+            {
+                'error': f'No assets found for domain {domain.root_domain}',
+                'domain_id': domain.id,
+                'domain': domain.root_domain,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    payload = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+    payload['asset_ids'] = asset_ids
+
+    factory = APIRequestFactory()
+    delegated_request = factory.post('/api/nuclei/scan/', payload, format='json')
+
+    if hasattr(request, 'user'):
+        delegated_request.user = request.user
+
+    return execute_nuclei_scan(delegated_request)
 
 def _process_nuclei_results(scan, asset, results, templates):
     """
