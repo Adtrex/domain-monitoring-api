@@ -8,6 +8,22 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _version_context(finding: Dict) -> str:
+    """Return a prompt fragment with the real detected/latest versions, if known.
+
+    These come from the package-registry lookup done at scan time — they are the
+    only trustworthy version source, so the model must use them verbatim.
+    """
+    detected = (finding.get('detected_version') or '').strip()
+    latest = (finding.get('latest_version') or '').strip()
+    if not detected and not latest:
+        return ''
+    return (
+        f"\nDetected version: {detected or 'unknown'}"
+        f"\nLatest version (from official package registry): {latest or 'unknown'}"
+    )
+
+
 def get_groq_client():
     """Initialize and return Groq client."""
     try:
@@ -35,15 +51,16 @@ def generate_issue_summary(finding: Dict) -> str:
     category = finding.get('category', 'Other')
     risk_rating = finding.get('risk_rating', 'Medium')
     evidence = finding.get('evidence', '')
+    version_block = _version_context(finding)
 
     prompt = f"""You are a cybersecurity expert. Generate a concise "About this Issue" explanation (2-3 sentences) for a security finding.
 
 Finding Title: {title}
 Category: {category}
 Severity: {risk_rating}
-Description: {evidence}
+Description: {evidence}{version_block}
 
-Explain what the vulnerability is, why it's a problem, and business impact. Keep it clear and technical but accessible. No markdown."""
+Explain what the vulnerability is, why it's a problem, and business impact. Keep it clear and technical but accessible. Use only the version numbers provided above — never invent one. No markdown."""
 
     try:
         message = client.chat.completions.create(
@@ -69,19 +86,22 @@ def generate_remediation_steps(finding: Dict) -> str:
     category = finding.get('category', 'Other')
     risk_rating = finding.get('risk_rating', 'Medium')
     asset = finding.get('asset', 'unknown asset')
+    version_block = _version_context(finding)
 
     prompt = f"""You are a cybersecurity remediation expert. Generate specific, actionable remediation steps for a security finding.
 
 Finding: {title}
 Category: {category}
 Severity: {risk_rating}
-Affected Asset: {asset}
+Affected Asset: {asset}{version_block}
 
 Provide 3-4 concrete remediation steps that are:
 - Specific and actionable
 - Prioritized by impact
 - Include timeline context based on severity
 - Include testing/validation step
+
+IMPORTANT: Use ONLY the version numbers provided above. Never invent, guess, or assume a version number from your own knowledge. If a "Latest version" is given, reference that exact value. If the detected version already equals the latest version, state that it is current and likely a false positive rather than recommending an upgrade.
 
 Format as numbered list. No markdown, plain text only."""
 

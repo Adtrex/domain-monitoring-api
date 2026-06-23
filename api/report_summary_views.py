@@ -9,9 +9,11 @@ logger = logging.getLogger(__name__)
 from django.db import transaction
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from .permissions import get_user_organisation
 
 from .models import (
     Asset,
@@ -416,29 +418,9 @@ def _extract_findings(domain_obj: Domain, asset_obj: Optional[Asset], scan_obj: 
             }
         )
 
-    email_rows = list(email_qs.order_by("-checked_at")[:100])
-    for row in email_rows:
-        is_pass = (row.status or "").upper() == "PASS"
-        title = f"Email Auth {row.check_type}: {row.status}"
-        detail = row.details or "Email authentication misconfiguration detected."
-        recommendation = "Maintain this control and continue periodic validation." if is_pass else "Correct SPF/DKIM/DMARC records and verify alignment."
-        advice = _build_issue_and_action(
-            detail=detail,
-            recommendation=recommendation,
-            fallback_action="Correct SPF/DKIM/DMARC records and verify alignment.",
-        )
-        items.append(
-            {
-                "finding_type": "Email",
-                "title": title,
-                "severity": "Low" if is_pass else _normalize_severity(row.risk_rating),
-                "risk_summary": advice["issue_summary"],
-                "recommendation_summary": advice["recommendation_summary"],
-                "external_reference": get_external_reference(title, detail),
-                "affected_asset": row.asset.value,
-            }
-        )
-
+    # Email authentication (SPF/DKIM/DMARC) is a DOMAIN-level control published on
+    # the organisational/root domain — it does not apply to arbitrary subdomains.
+    # Only include email findings when the primary/root domain is part of the scope.
     primary_assets = [a.value for a in asset_qs if _is_primary_domain_asset(a.value, domain_obj.root_domain)]
     used_regex_fallback = False
     if not primary_assets:
@@ -446,13 +428,37 @@ def _extract_findings(domain_obj: Domain, asset_obj: Optional[Asset], scan_obj: 
         used_regex_fallback = bool(primary_assets)
 
     if primary_assets:
-        primary_asset = sorted(primary_assets)[0]
         matcher = _asset_matches_domain_regex if used_regex_fallback else _is_primary_domain_asset
-        existing_types_for_primary = {
-            (row.check_type or "").upper()
-            for row in email_rows
+        primary_asset = sorted(primary_assets)[0]
+
+        # Real SPF/DKIM/DMARC checks, restricted to the primary domain asset only.
+        email_rows = [
+            row for row in email_qs.order_by("-checked_at")[:100]
             if row.asset and matcher(row.asset.value, domain_obj.root_domain)
-        }
+        ]
+        for row in email_rows:
+            is_pass = (row.status or "").upper() == "PASS"
+            title = f"Email Auth {row.check_type}: {row.status}"
+            detail = row.details or "Email authentication misconfiguration detected."
+            recommendation = "Maintain this control and continue periodic validation." if is_pass else "Correct SPF/DKIM/DMARC records and verify alignment."
+            advice = _build_issue_and_action(
+                detail=detail,
+                recommendation=recommendation,
+                fallback_action="Correct SPF/DKIM/DMARC records and verify alignment.",
+            )
+            items.append(
+                {
+                    "finding_type": "Email",
+                    "title": title,
+                    "severity": "Low" if is_pass else _normalize_severity(row.risk_rating),
+                    "risk_summary": advice["issue_summary"],
+                    "recommendation_summary": advice["recommendation_summary"],
+                    "external_reference": get_external_reference(title, detail),
+                    "affected_asset": row.asset.value,
+                }
+            )
+
+        existing_types_for_primary = {(row.check_type or "").upper() for row in email_rows}
         for check_type in ("SPF", "DKIM", "DMARC"):
             if check_type in existing_types_for_primary:
                 continue
@@ -842,6 +848,13 @@ def _build_narrative_sections(summary: ReportSummary, findings: List[ReportSumma
     else:
         matcher = None
         used_assets = []
+
+    # SPF/DKIM/DMARC are DOMAIN-level controls published on the organisational/root
+    # domain — they do not apply to subdomains. If the report scope has no primary
+    # domain asset (e.g. a subdomain-only export), omit the email section entirely.
+    if matcher is None:
+        return sections
+
     # Gather all checks for the used assets
     email_qs = EmailSecurityCheck.objects.filter(asset__in=asset_qs)
     if scan_obj is not None:
@@ -1267,11 +1280,13 @@ def _render_docx(summary: ReportSummary, findings: List[ReportSummaryFinding]) -
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReportSummaryExportView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, scan_id=None, report_format=None, asset_id=None):
         # --- Import report_style_config for findings_preview and summary logic ---
         from . import report_style_config
+
+        org = get_user_organisation(request)
 
         domain_name = (request.query_params.get("domain") or "").strip()
         asset_value = (request.query_params.get("asset") or "").strip()
@@ -1287,7 +1302,7 @@ class ReportSummaryExportView(APIView):
                 scan_id_int = int(scan_id_value)
             except ValueError:
                 return Response({"error": "scan_id must be an integer"}, status=400)
-            scan_obj = get_object_or_404(Scan, id=scan_id_int)
+            scan_obj = get_object_or_404(Scan, id=scan_id_int, organisation=org)
 
         scan_assets = []
         if scan_obj is not None:
@@ -1300,7 +1315,7 @@ class ReportSummaryExportView(APIView):
 
         asset_obj = None
         if asset_id is not None:
-            asset_obj = get_object_or_404(Asset, id=asset_id)
+            asset_obj = get_object_or_404(Asset, id=asset_id, organisation=org)
             if scan_obj is not None and not ScanAsset.objects.filter(scan=scan_obj, asset=asset_obj).exists():
                 return Response(
                     {"error": f"Asset {asset_id} is not part of scan {scan_obj.id}"},
@@ -1309,7 +1324,7 @@ class ReportSummaryExportView(APIView):
             domain_obj = asset_obj.domain
         else:
             if domain_name:
-                domain_obj = get_object_or_404(Domain, root_domain__iexact=domain_name)
+                domain_obj = get_object_or_404(Domain, root_domain__iexact=domain_name, organisation=org)
             elif scan_obj is not None:
                 domain_ids = {row.asset.domain_id for row in scan_assets}
                 if len(domain_ids) != 1:
@@ -1322,7 +1337,7 @@ class ReportSummaryExportView(APIView):
                 return Response({"error": "domain or scan_id is required"}, status=400)
 
             if asset_value:
-                asset_obj = get_object_or_404(Asset, domain=domain_obj, value=asset_value)
+                asset_obj = get_object_or_404(Asset, domain=domain_obj, value=asset_value, organisation=org)
             elif scan_assets:
                 unique_asset_ids = {row.asset_id for row in scan_assets if row.asset.domain_id == domain_obj.id}
                 if len(unique_asset_ids) == 1:
@@ -1433,6 +1448,7 @@ class ReportSummaryExportView(APIView):
                 asset=asset_obj,
                 scan=scan_obj,
                 defaults={
+                    "organisation": org,
                     "organization_name": resolved_org,
                     "executive_summary": executive_summary,
                     "scope_note": _make_scope_note(

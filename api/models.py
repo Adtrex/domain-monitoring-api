@@ -1,13 +1,181 @@
+import secrets
+from datetime import timedelta
+
 from django.db import models
+from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 
 from django.utils import timezone
+from django.utils.text import slugify
+
+
+# ============================================
+# ORGANISATION / TENANCY MODELS
+# ============================================
+
+def _default_invite_token():
+    """Generate a URL-safe unique token for invitations."""
+    return secrets.token_urlsafe(32)
+
+
+def _default_invite_expiry():
+    """Invitations are valid for 7 days by default."""
+    return timezone.now() + timedelta(days=7)
+
+
+class Organisation(models.Model):
+    """Top-level tenant. Every piece of scan data is scoped to one organisation."""
+    name = models.CharField(max_length=255, unique=True)
+    slug = models.SlugField(max_length=255, unique=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'organisations'
+        ordering = ['name']
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name) or 'org'
+            slug = base
+            counter = 1
+            while Organisation.objects.filter(slug=slug).exclude(pk=self.pk).exists():
+                counter += 1
+                slug = f"{base}-{counter}"
+            self.slug = slug
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class Membership(models.Model):
+    """Links a Django user to exactly one organisation, with a role."""
+    ROLE_CHOICES = [
+        ('owner', 'Owner'),
+        ('admin', 'Admin'),
+        ('member', 'Member'),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='membership',
+    )
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='memberships'
+    )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='member')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'memberships'
+        ordering = ['organisation', 'role', 'user_id']
+
+    @property
+    def can_manage_members(self):
+        return self.role in ('owner', 'admin')
+
+    def __str__(self):
+        return f"{self.user} @ {self.organisation} ({self.role})"
+
+
+class PlatformAdmin(models.Model):
+    """A platform-wide super administrator.
+
+    Decoupled from Django's is_superuser flag: presence of a row here grants
+    full cross-organisation access *through the application/API*, without
+    necessarily granting raw Django-admin/database access.
+    """
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='platform_admin'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    note = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        db_table = 'platform_admins'
+
+    def __str__(self):
+        return f"PlatformAdmin: {self.user}"
+
+
+class AuditLog(models.Model):
+    """Append-only record of notable actions across the platform."""
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_logs',
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_actions',
+    )
+    actor_email = models.CharField(max_length=255, blank=True)
+    action = models.CharField(max_length=80)
+    target = models.CharField(max_length=300, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'audit_logs'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['-created_at']),
+            models.Index(fields=['action']),
+            models.Index(fields=['organisation', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.action} by {self.actor_email or 'system'} @ {self.created_at:%Y-%m-%d %H:%M}"
+
+
+class Invitation(models.Model):
+    """An email invite for a user to join an organisation and set their password."""
+    ROLE_CHOICES = Membership.ROLE_CHOICES
+
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='invitations'
+    )
+    email = models.EmailField()
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='member')
+    token = models.CharField(max_length=64, unique=True, default=_default_invite_token)
+    invited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='sent_invitations',
+    )
+    accepted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(default=_default_invite_expiry)
+
+    class Meta:
+        db_table = 'invitations'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['token']),
+            models.Index(fields=['email']),
+        ]
+
+    @property
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+
+    @property
+    def is_valid(self):
+        return not self.accepted and not self.is_expired
+
+    def __str__(self):
+        return f"Invite {self.email} -> {self.organisation} ({self.role})"
+
 
 # ============================================
 # REPORTING SUMMARY MODEL
 # ============================================
 class ReportSummary(models.Model):
     """Domain/asset/scan scoped security summary export record"""
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='report_summaries'
+    )
     organization_name = models.CharField(max_length=255)
     domain = models.ForeignKey('Domain', on_delete=models.CASCADE, related_name='report_summaries')
     asset = models.ForeignKey('Asset', on_delete=models.SET_NULL, related_name='report_summaries', null=True, blank=True)
@@ -24,6 +192,12 @@ class ReportSummary(models.Model):
     class Meta:
         db_table = 'report_summary'
         ordering = ['-generated_at']
+
+    def save(self, *args, **kwargs):
+        # Inherit organisation from the parent domain when not set explicitly.
+        if self.organisation_id is None and self.domain_id is not None:
+            self.organisation_id = self.domain.organisation_id
+        super().save(*args, **kwargs)
 
     def __str__(self):
         scope = self.asset.value if self.asset else self.domain.root_domain
@@ -43,8 +217,11 @@ class ReportSummaryFinding(models.Model):
     finding_type = models.CharField(max_length=80)
     title = models.CharField(max_length=300)
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES)
-    risk_summary = models.CharField(max_length=400)
-    external_reference = models.URLField()
+    # TextField: stores free-form finding evidence which can exceed varchar(400).
+    risk_summary = models.TextField(blank=True, default='')
+    # TextField (not URLField): the report can join multiple long reference URLs
+    # / Google-search fallback links that exceed the old varchar(200) limit.
+    external_reference = models.TextField(blank=True, default='')
     affected_asset = models.CharField(max_length=500)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -68,17 +245,23 @@ class Domain(models.Model):
         ('Suspended', 'Suspended'),
     ]
     
-    root_domain = models.CharField(max_length=255, unique=True)
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='domains'
+    )
+    root_domain = models.CharField(max_length=255)
+    # Each organisation has one primary domain, assigned by a platform admin.
+    is_primary = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Active')
     registrar = models.CharField(max_length=255, blank=True, null=True)
     expiry_date = models.DateTimeField(blank=True, null=True)
     owner = models.CharField(max_length=255, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
         db_table = 'domains'
         ordering = ['root_domain']
+        unique_together = [('organisation', 'root_domain')]
         indexes = [
             models.Index(fields=['status']),
             models.Index(fields=['expiry_date']),
@@ -96,6 +279,9 @@ class Asset(models.Model):
         ('url', 'URL'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='assets'
+    )
     domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='assets')
     asset_type = models.CharField(max_length=20, choices=ASSET_TYPE_CHOICES)
     value = models.CharField(max_length=500)  # URL or domain value
@@ -111,7 +297,13 @@ class Asset(models.Model):
             models.Index(fields=['domain', 'asset_type']),
             models.Index(fields=['value']),
         ]
-    
+
+    def save(self, *args, **kwargs):
+        # Inherit organisation from the parent domain when not set explicitly.
+        if self.organisation_id is None and self.domain_id is not None:
+            self.organisation_id = self.domain.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.asset_type}: {self.value}"
 
@@ -136,6 +328,9 @@ class Scan(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='scans'
+    )
     initiated_by = models.IntegerField(blank=True, null=True)  # User ID placeholder
     scan_type = models.CharField(max_length=20, choices=SCAN_TYPE_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='queued')
@@ -208,6 +403,9 @@ class Finding(models.Model):
         ('Low', 'Low'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='findings'
+    )
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='findings')
     title = models.CharField(max_length=500)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
@@ -232,7 +430,13 @@ class Finding(models.Model):
             models.Index(fields=['status']),
             models.Index(fields=['-cvss_score']),
         ]
-    
+
+    def save(self, *args, **kwargs):
+        # Inherit organisation from the parent asset when not set explicitly.
+        if self.organisation_id is None and self.asset_id is not None:
+            self.organisation_id = self.asset.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.title} - {self.risk_rating}"
 
@@ -314,6 +518,9 @@ class FrontendLibraryCheck(models.Model):
         ('Critical', 'Critical'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='library_checks'
+    )
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='library_checks')
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='library_checks')
     library_name = models.CharField(max_length=200)
@@ -328,7 +535,12 @@ class FrontendLibraryCheck(models.Model):
     class Meta:
         db_table = 'frontend_library_checks'
         ordering = ['-checked_at']
-    
+
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.library_name} {self.detected_version}"
 
@@ -342,6 +554,9 @@ class SSLTLSCheck(models.Model):
         ('hsts', 'HSTS'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='ssl_checks'
+    )
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='ssl_checks')
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='ssl_checks')
     check_type = models.CharField(max_length=50, choices=CHECK_TYPE_CHOICES)
@@ -361,7 +576,12 @@ class SSLTLSCheck(models.Model):
     class Meta:
         db_table = 'ssl_tls_checks'
         ordering = ['-checked_at']
-    
+
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.check_type} - {self.asset.value}"
 
@@ -380,6 +600,9 @@ class EmailSecurityCheck(models.Model):
         ('INVALID', 'Invalid'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='email_checks'
+    )
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='email_checks')
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='email_checks')
     check_type = models.CharField(max_length=20, choices=CHECK_TYPE_CHOICES)
@@ -394,7 +617,12 @@ class EmailSecurityCheck(models.Model):
     class Meta:
         db_table = 'email_security_checks'
         ordering = ['-checked_at']
-    
+
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.check_type} - {self.status}"
 
@@ -407,6 +635,9 @@ class SecurityHeaderCheck(models.Model):
         ('misconfigured', 'Misconfigured'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='header_checks'
+    )
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='header_checks')
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='header_checks')
     header = models.CharField(max_length=200)
@@ -420,7 +651,12 @@ class SecurityHeaderCheck(models.Model):
     class Meta:
         db_table = 'security_header_checks'
         ordering = ['-checked_at']
-    
+
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.header} - {self.status}"
 
@@ -434,6 +670,9 @@ class DNSSecurityCheck(models.Model):
         ('subdomain_takeover', 'Subdomain Takeover'),
     ]
     
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='dns_checks'
+    )
     scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name='dns_checks')
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='dns_checks')
     check_type = models.CharField(max_length=50, choices=CHECK_TYPE_CHOICES)
@@ -447,11 +686,19 @@ class DNSSecurityCheck(models.Model):
     class Meta:
         db_table = 'dns_security_checks'
         ordering = ['-checked_at']
-    
+
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.check_type} - {self.asset.value}"
 
 class TechnologyCheck(models.Model):
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name='technology_checks'
+    )
     scan = models.ForeignKey(Scan, related_name='technology_checks', on_delete=models.CASCADE)
     asset = models.ForeignKey(Asset, on_delete=models.CASCADE)
 
@@ -468,5 +715,52 @@ class TechnologyCheck(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+        if self.organisation_id is None and self.scan_id is not None:
+            self.organisation_id = self.scan.organisation_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.technology_name} {self.version}"
+
+
+# ============================================
+# MAINTENANCE HELPERS
+# ============================================
+
+def finalize_stale_scans(timeout_minutes=None, organisation=None):
+    """Finalize orphaned scans stuck in 'running'/'queued'.
+
+    Scans run synchronously inside the HTTP request, so a server restart (or a
+    killed worker) can leave a scan in 'running' forever with no process left to
+    finalize it. This sweeps any scan whose start is older than the timeout and
+    marks it 'cancelled' (if cancellation was requested) or 'failed' otherwise.
+
+    Real scans complete in minutes, so the default timeout is deliberately well
+    above that. Safe to call frequently — it only touches genuinely stale rows.
+    Returns the number of scans finalized.
+    """
+    if timeout_minutes is None:
+        timeout_minutes = getattr(settings, 'SCAN_STALE_TIMEOUT_MINUTES', 120)
+
+    cutoff = timezone.now() - timedelta(minutes=timeout_minutes)
+    qs = Scan.objects.filter(status__in=['queued', 'running']).filter(
+        models.Q(started_at__lt=cutoff)
+        | models.Q(started_at__isnull=True, created_at__lt=cutoff)
+    )
+    if organisation is not None:
+        qs = qs.filter(organisation=organisation)
+
+    count = 0
+    for scan in qs:
+        now = timezone.now()
+        scan.status = 'cancelled' if scan.cancel_requested else 'failed'
+        scan.finished_at = now
+        reference = scan.started_at or scan.created_at
+        scan.duration_seconds = int((now - reference).total_seconds()) if reference else 0
+        scan.error_message = scan.error_message or (
+            'Scan was interrupted (no active worker) and automatically finalized.'
+        )
+        scan.save(update_fields=['status', 'finished_at', 'duration_seconds', 'error_message'])
+        count += 1
+    return count

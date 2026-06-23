@@ -3,16 +3,85 @@ Fixed Open Source CVE Checker for CERRT
 Uses only free/open-source services with improved library matching
 """
 
+import functools
 import requests
 import re
 import json
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 import logging
 from packaging.version import InvalidVersion, Version
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+
+
+# Products covered by the endoflife.date API, keyed by normalized component name.
+_EOL_PRODUCT_MAP = {
+    'php': 'php', 'wordpress': 'wordpress', 'nginx': 'nginx', 'apache': 'apache',
+    'node': 'nodejs', 'nodejs': 'nodejs', 'node.js': 'nodejs', 'python': 'python',
+    'mysql': 'mysql', 'mariadb': 'mariadb', 'postgresql': 'postgresql',
+    'openssl': 'openssl', 'jquery': 'jquery', 'bootstrap': 'bootstrap',
+    'laravel': 'laravel', 'django': 'django', 'drupal': 'drupal', 'tomcat': 'tomcat',
+    'angular': 'angular', 'vue': 'vue', 'symfony': 'symfony', 'ruby': 'ruby',
+}
+
+
+@functools.lru_cache(maxsize=256)
+def fetch_eol_status(product_name: str, version: str) -> Optional[Dict[str, Any]]:
+    """Look up end-of-life / support status for a product version via endoflife.date.
+
+    Returns {cycle, eol, latest, support, is_eol} or None when the product isn't
+    covered or the lookup fails. Never guesses — on any error it returns None so
+    callers fall back to neutral wording rather than a false EOL claim.
+    """
+    slug = _EOL_PRODUCT_MAP.get((product_name or '').strip().lower())
+    if not slug or not version:
+        return None
+
+    try:
+        resp = requests.get(f"https://endoflife.date/api/{slug}.json", timeout=8)
+        if resp.status_code != 200:
+            return None
+        cycles = resp.json()
+    except Exception as exc:
+        logger.debug("endoflife.date lookup failed for %s %s: %s", product_name, version, exc)
+        return None
+
+    ver = (version or '').lstrip('vV').strip()
+    parts = ver.split('.')
+    candidates = []
+    if len(parts) >= 2:
+        candidates.append(f"{parts[0]}.{parts[1]}")
+    if parts:
+        candidates.append(parts[0])
+
+    cycle_row = None
+    for cand in candidates:
+        for row in cycles:
+            if str(row.get('cycle')) == cand:
+                cycle_row = row
+                break
+        if cycle_row:
+            break
+    if not cycle_row:
+        return None
+
+    eol = cycle_row.get('eol')
+    is_eol = None
+    if isinstance(eol, bool):
+        is_eol = eol
+    elif isinstance(eol, str):
+        # ISO date strings compare correctly lexicographically.
+        is_eol = eol < date.today().isoformat()
+
+    return {
+        'cycle': cycle_row.get('cycle'),
+        'eol': eol,
+        'latest': cycle_row.get('latest'),
+        'support': cycle_row.get('support'),
+        'is_eol': is_eol,
+    }
 
 
 # ============================================

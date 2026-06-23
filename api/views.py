@@ -31,8 +31,10 @@ from .serializers import TechnologyCheckSerializer
 from .models import (
     Domain, Asset, Scan, ScanAsset, Finding, ScanFinding, CVE, FindingCVE,
     FrontendLibraryCheck, SSLTLSCheck, EmailSecurityCheck,
-    SecurityHeaderCheck, DNSSecurityCheck, ReportSummary
+    SecurityHeaderCheck, DNSSecurityCheck, ReportSummary, finalize_stale_scans
 )
+from .permissions import OrganisationScopedMixin, get_user_organisation, is_platform_admin, requested_org_id, IsPlatformAdmin
+from .audit import log_action
 from .serializers import (
     DomainSerializer, AssetSerializer, ScanListSerializer, ScanDetailSerializer,
     ScanCreateSerializer, FindingSerializer, FrontendLibraryCheckSerializer,
@@ -46,7 +48,7 @@ from io import BytesIO
 from django.views import View
 from django.http import FileResponse
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 import tempfile
 try:
     from reportlab.pdfgen import canvas
@@ -73,7 +75,6 @@ def _domain_to_org_name(root_domain):
 # REPORT SUMMARY ENDPOINT
 # ============================================
 class ReportSummaryDownloadView(APIView):
-    permission_classes = [AllowAny]
 
     def get(self, request, format=None):
         """
@@ -288,6 +289,28 @@ class StandardPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+
+def _scoped_scan(request, scan_id):
+    """Fetch a scan by id, scoped to the caller's organisation.
+
+    Platform admins have full cross-org access, so they can fetch any scan.
+    """
+    if is_platform_admin(getattr(request, 'user', None)):
+        return get_object_or_404(Scan, id=scan_id)
+    org = get_user_organisation(request)
+    return get_object_or_404(Scan, id=scan_id, organisation=org)
+
+
+def _scoped_domain(request, domain_id):
+    """Fetch a domain by id, scoped to the caller's organisation.
+
+    Platform admins have full cross-org access, so they can fetch any domain.
+    """
+    if is_platform_admin(getattr(request, 'user', None)):
+        return get_object_or_404(Domain, id=domain_id)
+    org = get_user_organisation(request)
+    return get_object_or_404(Domain, id=domain_id, organisation=org)
 
 
 # ============================================
@@ -547,13 +570,60 @@ def discover_active_subdomains(root_domain: str, max_hosts: int = 2000,
 # DOMAIN & ASSET VIEWSETS
 # ============================================
 
-class DomainViewSet(viewsets.ModelViewSet):
+class DomainViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing domains
+    ViewSet for managing domains (scoped to the caller's organisation)
     """
     queryset = Domain.objects.all()
     serializer_class = DomainSerializer
     pagination_class = StandardPagination
+
+    def get_permissions(self):
+        # Domains are assigned by the platform admin only. Org users get read
+        # access plus the discover-subdomains / posture actions, but cannot
+        # create, edit, delete, or re-assign the primary domain.
+        if self.action in ('create', 'update', 'partial_update', 'destroy', 'set_primary'):
+            return [IsAuthenticated(), IsPlatformAdmin()]
+        return [IsAuthenticated()]
+
+    def _apply_primary(self, domain):
+        """Enforce a single primary domain per organisation."""
+        if domain.is_primary:
+            Domain.objects.filter(
+                organisation=domain.organisation, is_primary=True
+            ).exclude(pk=domain.pk).update(is_primary=False)
+
+    def _ensure_apex_asset(self, domain):
+        """Auto-create the apex (root_domain) asset so the domain is scannable."""
+        Asset.objects.get_or_create(
+            domain=domain, value=domain.root_domain,
+            defaults={'asset_type': 'root_domain', 'source': 'platform-admin'},
+        )
+
+    def perform_create(self, serializer):
+        obj = serializer.save(organisation=self.get_organisation())
+        self._apply_primary(obj)
+        self._ensure_apex_asset(obj)
+        log_action('domain.create', request=self.request,
+                   organisation=obj.organisation, target=obj.root_domain,
+                   is_primary=obj.is_primary)
+
+    def perform_update(self, serializer):
+        obj = serializer.save()
+        self._apply_primary(obj)
+
+    @action(detail=True, methods=['post'], url_path='set-primary')
+    def set_primary(self, request, pk=None):
+        """Mark this domain as the organisation's primary (platform admin only)."""
+        domain = self.get_object()
+        Domain.objects.filter(
+            organisation=domain.organisation, is_primary=True
+        ).exclude(pk=domain.pk).update(is_primary=False)
+        domain.is_primary = True
+        domain.save(update_fields=['is_primary'])
+        log_action('domain.set_primary', request=request,
+                   organisation=domain.organisation, target=domain.root_domain)
+        return Response(DomainSerializer(domain).data)
 
     @action(detail=True, methods=['post'], url_path='discover-subdomains')
     def discover_subdomains(self, request, pk=None):
@@ -815,17 +885,18 @@ class DomainViewSet(viewsets.ModelViewSet):
         return check.status.lower() if check.status else 'unknown'
 
 
-class AssetViewSet(viewsets.ModelViewSet):
+class AssetViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing assets
+    ViewSet for managing assets (scoped to the caller's organisation)
     """
     queryset = Asset.objects.all()
     serializer_class = AssetSerializer
     pagination_class = StandardPagination
 
     def get_queryset(self):
-        """Filter assets in the database by domain when requested."""
-        queryset = super().get_queryset().select_related('domain')
+        """Filter assets by the caller's organisation (platform admins: all orgs),
+        then by domain when requested."""
+        queryset = self.scope_queryset(Asset.objects.select_related('domain'))
 
         domain = self.request.GET.get('domain') or self.request.GET.get('domain_id')
         if domain:
@@ -837,8 +908,14 @@ class AssetViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """Create an asset, but reuse an existing one if it already exists for the domain."""
+        org = self.get_organisation()
         domain_id = request.data.get('domain')
         raw_value = request.data.get('value', '')
+
+        # The target domain must belong to the caller's organisation.
+        if domain_id:
+            if not Domain.objects.filter(id=domain_id, organisation=org).exists():
+                raise ValidationError({'domain': 'Domain not found in your organisation.'})
 
         if domain_id and raw_value:
             candidates = _asset_value_candidates(raw_value)
@@ -847,7 +924,9 @@ class AssetViewSet(viewsets.ModelViewSet):
                 for candidate in candidates:
                     query |= Q(value__iexact=candidate)
 
-                existing = Asset.objects.filter(domain_id=domain_id).filter(query).order_by('id').first()
+                existing = Asset.objects.filter(
+                    organisation=org, domain_id=domain_id
+                ).filter(query).order_by('id').first()
                 if existing:
                     serializer = self.get_serializer(existing)
                     return Response(serializer.data, status=status.HTTP_200_OK)
@@ -862,7 +941,9 @@ class AssetViewSet(viewsets.ModelViewSet):
                 query = Q()
                 for candidate in candidates:
                     query |= Q(value__iexact=candidate)
-                existing = Asset.objects.filter(domain_id=domain_id).filter(query).order_by('id').first()
+                existing = Asset.objects.filter(
+                    organisation=org, domain_id=domain_id
+                ).filter(query).order_by('id').first()
                 if existing:
                     serializer = self.get_serializer(existing)
                     return Response(serializer.data, status=status.HTTP_200_OK)
@@ -873,17 +954,23 @@ class AssetViewSet(viewsets.ModelViewSet):
 # SCAN MANAGEMENT VIEWSET
 # ============================================
 
-class ScanViewSet(viewsets.ModelViewSet):
+class ScanViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing scans
+    ViewSet for managing scans (scoped to the caller's organisation)
     """
     queryset = Scan.objects.all()
     pagination_class = StandardPagination
 
     def get_queryset(self):
         """
-        Filter scans based on query parameters
+        Filter scans based on query parameters (already org-scoped by the mixin)
         """
+        # Auto-finalize orphaned scans (e.g. left 'running' by a server restart)
+        # so the UI never shows a permanently-running scan.
+        if is_platform_admin(self.request.user):
+            finalize_stale_scans()  # sweep across all organisations
+        else:
+            finalize_stale_scans(organisation=self.get_organisation())
         queryset = super().get_queryset()
         
         # Filter by domain_id: returns scans that scanned assets belonging to this domain
@@ -931,26 +1018,32 @@ class ScanViewSet(viewsets.ModelViewSet):
         asset_ids = serializer.validated_data['asset_ids']
         scan_type = serializer.validated_data.get('scan_type', 'on-demand')
         template_categories = serializer.validated_data.get('template_categories', [])
-        
-        # Validate assets exist
-        assets = Asset.objects.filter(id__in=asset_ids)
-        if assets.count() != len(asset_ids):
+
+        org = self.get_organisation()
+
+        # Validate assets exist within the caller's organisation
+        assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
+        if assets.count() != len(set(asset_ids)):
             return Response(
-                {'error': 'One or more asset IDs not found'},
+                {'error': 'One or more asset IDs not found in your organisation'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         # Create scan
         scan = Scan.objects.create(
+            organisation=org,
             scan_type=scan_type,
             status='queued',
-            initiated_by=request.user.id if hasattr(request, 'user') else None
+            initiated_by=request.user.id if request.user.is_authenticated else None
         )
         
         # Link assets to scan
         for asset in assets:
             ScanAsset.objects.create(scan=scan, asset=asset)
-        
+
+        log_action('scan.create', request=request, organisation=org,
+                   target=f"scan #{scan.id}", scan_id=scan.id, asset_count=len(assets))
+
         return Response(
             ScanDetailSerializer(scan).data,
             status=status.HTTP_201_CREATED
@@ -2047,7 +2140,7 @@ def scan_library_checks(request, scan_id):
     Get frontend library checks for a scan
     GET /api/scans/{scan_id}/library-checks/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = FrontendLibraryCheck.objects.filter(scan=scan).select_related('asset')
     
     # Optional filtering
@@ -2073,7 +2166,7 @@ def scan_ssl_checks(request, scan_id):
     Get SSL/TLS checks for a scan
     GET /api/scans/{scan_id}/ssl-checks/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = SSLTLSCheck.objects.filter(scan=scan).select_related('asset')
     
     # Optional filtering
@@ -2099,7 +2192,7 @@ def scan_email_checks(request, scan_id):
     Get email security checks for a scan
     GET /api/scans/{scan_id}/email-checks/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = EmailSecurityCheck.objects.filter(scan=scan).select_related('asset')
     
     # Optional filtering
@@ -2125,7 +2218,7 @@ def scan_header_checks(request, scan_id):
     Get security header checks for a scan
     GET /api/scans/{scan_id}/header-checks/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = SecurityHeaderCheck.objects.filter(scan=scan).select_related('asset')
     
     # Optional filtering
@@ -2526,7 +2619,7 @@ def scan_header_scorecard(request, scan_id):
     Security headers grading endpoint for frontend scorecard UIs.
     GET /api/scans/{scan_id}/header-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = list(
         SecurityHeaderCheck.objects.filter(scan=scan)
         .select_related('asset')
@@ -2541,7 +2634,7 @@ def scan_ssl_scorecard(request, scan_id):
     SSL/TLS grading endpoint for frontend scorecard UIs.
     GET /api/scans/{scan_id}/ssl-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = list(SSLTLSCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
 
     return Response(_build_ssl_scorecard_data(scan_id, checks))
@@ -2553,7 +2646,7 @@ def scan_email_scorecard(request, scan_id):
     Email security grading endpoint for frontend scorecard UIs.
     GET /api/scans/{scan_id}/email-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = list(EmailSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
 
     return Response(_build_email_scorecard_data(scan_id, checks))
@@ -2565,7 +2658,7 @@ def scan_dns_scorecard(request, scan_id):
     DNS health grading endpoint for frontend scorecard UIs.
     GET /api/scans/{scan_id}/dns-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = list(DNSSecurityCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
 
     return Response(_build_dns_scorecard_data(scan_id, checks))
@@ -2577,7 +2670,7 @@ def scan_library_scorecard(request, scan_id):
     Frontend library grading endpoint for frontend scorecard UIs.
     GET /api/scans/{scan_id}/library-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = list(
         FrontendLibraryCheck.objects.filter(scan=scan)
         .select_related('asset')
@@ -2593,7 +2686,7 @@ def scan_overall_scorecard(request, scan_id):
     Combined scorecard across key factors for dashboard rendering.
     GET /api/scans/{scan_id}/overall-scorecard/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
 
     header_checks = list(SecurityHeaderCheck.objects.filter(scan=scan).select_related('asset').order_by('header'))
     ssl_checks = list(SSLTLSCheck.objects.filter(scan=scan).select_related('asset').order_by('check_type', 'id'))
@@ -2643,7 +2736,7 @@ def scan_dns_checks(request, scan_id):
     Get DNS security checks for a scan
     GET /api/scans/{scan_id}/dns-checks/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     checks = DNSSecurityCheck.objects.filter(scan=scan).select_related('asset')
     
     # Optional filtering
@@ -2678,7 +2771,7 @@ def scan_findings(request, scan_id):
     
     FIXED: Now properly returns all findings with correct filtering
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     
     # ✅ FIXED: Use QuerySet methods for filtering BEFORE converting to list
     scan_findings_qs = ScanFinding.objects.filter(
@@ -2756,7 +2849,8 @@ def scan_report_download(request, scan_id, report_format='json', domain_name=Non
         report_format,
         domain_name or None,
     )
-    scan = Scan.objects.filter(id=scan_id).first()
+    org = get_user_organisation(request)
+    scan = Scan.objects.filter(id=scan_id, organisation=org).first()
     if not scan:
         return Response(
             {
@@ -2908,7 +3002,8 @@ def report_download_debug(request, scan_id, report_format='json'):
 
     """Debug endpoint to isolate where report generation fails."""
     report_format = (report_format or request.GET.get('format', 'json')).lower()
-    scan = Scan.objects.filter(id=scan_id).first()
+    org = get_user_organisation(request)
+    scan = Scan.objects.filter(id=scan_id, organisation=org).first()
 
     if not scan:
         return Response(
@@ -3016,8 +3111,9 @@ def all_findings(request):
     - page: Page number
     - page_size: Results per page (max 1000)
     """
-    findings_qs = Finding.objects.all().select_related('asset', 'asset__domain')
-    
+    org = get_user_organisation(request)
+    findings_qs = Finding.objects.filter(organisation=org).select_related('asset', 'asset__domain')
+
     # Filters
     asset_id = request.GET.get('asset_id')
     if asset_id:
@@ -3086,7 +3182,7 @@ def all_findings(request):
 @api_view(['GET'])
 def scan_technology_checks(request, scan_id):
 
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
 
     checks = TechnologyCheck.objects.filter(scan=scan).select_related('asset')
 
@@ -3149,8 +3245,9 @@ def execute_nuclei_scan(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # Get assets
-    assets = Asset.objects.filter(id__in=asset_ids)
+    # Get assets (scoped to the caller's organisation)
+    org = get_user_organisation(request)
+    assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
     if not assets.exists():
         return Response(
             {'error': f'No valid assets found for IDs: {asset_ids}'},
@@ -3176,6 +3273,7 @@ def execute_nuclei_scan(request):
     
     # Create scan record
     scan = Scan.objects.create(
+        organisation=org,
         scan_type=scan_type,
         status='running',
         started_at=timezone.now()
@@ -3769,7 +3867,7 @@ def execute_domain_scan(request, domain_id):
         "extract_org": true
     }
     """
-    domain = get_object_or_404(Domain, id=domain_id)
+    domain = _scoped_domain(request, domain_id)
     asset_ids = list(domain.assets.values_list('id', flat=True))
 
     if not asset_ids:
@@ -3785,11 +3883,19 @@ def execute_domain_scan(request, domain_id):
     payload = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
     payload['asset_ids'] = asset_ids
 
-    factory = APIRequestFactory()
-    delegated_request = factory.post('/api/nuclei/scan/', payload, format='json')
+    # execute_nuclei_scan is itself an @api_view, so it re-authenticates the
+    # request we hand it. Forward the caller's auth (and any org-targeting
+    # header) so that inner authentication succeeds instead of 401-ing.
+    forwarded = {}
+    auth_header = request.META.get('HTTP_AUTHORIZATION')
+    if auth_header:
+        forwarded['HTTP_AUTHORIZATION'] = auth_header
+    org_header = request.META.get('HTTP_X_ORGANISATION_ID')
+    if org_header:
+        forwarded['HTTP_X_ORGANISATION_ID'] = org_header
 
-    if hasattr(request, 'user'):
-        delegated_request.user = request.user
+    factory = APIRequestFactory()
+    delegated_request = factory.post('/api/nuclei/scan/', payload, format='json', **forwarded)
 
     return execute_nuclei_scan(delegated_request)
 
@@ -4437,27 +4543,29 @@ def dashboard_metrics(request):
     Get dashboard metrics
     GET /api/dashboard/metrics/
     """
-    total_scans = Scan.objects.count()
-    completed_scans = Scan.objects.filter(status='completed').count()
-    
+    org = get_user_organisation(request)
+    scans_qs = Scan.objects.filter(organisation=org)
+    total_scans = scans_qs.count()
+    completed_scans = scans_qs.filter(status='completed').count()
+
     # Get findings by risk level
-    findings_by_risk = Finding.objects.values('risk_rating').annotate(
+    findings_by_risk = Finding.objects.filter(organisation=org).values('risk_rating').annotate(
         count=Count('id')
     )
-    
+
     # Recent scans
-    recent_scans = Scan.objects.filter(
+    recent_scans = scans_qs.filter(
         created_at__gte=timezone.now() - timedelta(days=7)
     ).count()
-    
+
     return Response({
         'total_scans': total_scans,
         'completed_scans': completed_scans,
-        'failed_scans': Scan.objects.filter(status='failed').count(),
+        'failed_scans': scans_qs.filter(status='failed').count(),
         'recent_scans_week': recent_scans,
         'findings_by_risk': {item['risk_rating']: item['count'] for item in findings_by_risk},
-        'total_assets': Asset.objects.count(),
-        'total_domains': Domain.objects.count(),
+        'total_assets': Asset.objects.filter(organisation=org).count(),
+        'total_domains': Domain.objects.filter(organisation=org).count(),
     })
 
 @api_view(['GET'])
@@ -4466,7 +4574,7 @@ def debug_scan_data(request, scan_id):
     Debug endpoint to check scan data integrity
     GET /api/debug/scan/{scan_id}/
     """
-    scan = get_object_or_404(Scan, id=scan_id)
+    scan = _scoped_scan(request, scan_id)
     
     # Count findings
     scan_findings_count = ScanFinding.objects.filter(scan=scan).count()
@@ -4557,17 +4665,27 @@ def executive_dashboard(request):
     Returns all key metrics organized by priority tiers
     """
     logger.info("Generating executive dashboard...")
-    
+
+    # Platform admins may view the executive summary across every organisation
+    # (narrow to one org by passing organisation_id). Everyone else is scoped to
+    # their own organisation. org_filter is spread into each queryset below; an
+    # empty dict means "all organisations".
+    if is_platform_admin(request.user):
+        org_id = requested_org_id(request)
+        org_filter = {'organisation_id': org_id} if org_id else {}
+    else:
+        org_filter = {'organisation': get_user_organisation(request)}
+
     # ============================================
     # TIER 1 - CORE OVERVIEW
     # ============================================
-    
+
     # Overall Security Posture
-    total_findings = Finding.objects.count()
-    critical_findings = Finding.objects.filter(risk_rating='Critical', status='open').count()
-    high_findings = Finding.objects.filter(risk_rating='High', status='open').count()
-    medium_findings = Finding.objects.filter(risk_rating='Medium', status='open').count()
-    low_findings = Finding.objects.filter(risk_rating='Low', status='open').count()
+    total_findings = Finding.objects.filter(**org_filter).count()
+    critical_findings = Finding.objects.filter(**org_filter, risk_rating='Critical', status='open').count()
+    high_findings = Finding.objects.filter(**org_filter, risk_rating='High', status='open').count()
+    medium_findings = Finding.objects.filter(**org_filter, risk_rating='Medium', status='open').count()
+    low_findings = Finding.objects.filter(**org_filter, risk_rating='Low', status='open').count()
     
     # Calculate overall security score (0-100)
     # total_checks = (
@@ -4594,21 +4712,21 @@ def executive_dashboard(request):
 
     # Calculate overall security score (0-100)
     total_checks = (
-        FrontendLibraryCheck.objects.count() +
-        SSLTLSCheck.objects.count() +
-        EmailSecurityCheck.objects.count() +
-        SecurityHeaderCheck.objects.count() +
-        DNSSecurityCheck.objects.count()
+        FrontendLibraryCheck.objects.filter(**org_filter).count() +
+        SSLTLSCheck.objects.filter(**org_filter).count() +
+        EmailSecurityCheck.objects.filter(**org_filter).count() +
+        SecurityHeaderCheck.objects.filter(**org_filter).count() +
+        DNSSecurityCheck.objects.filter(**org_filter).count()
     )
 
     failed_checks = (
-        FrontendLibraryCheck.objects.filter(
+        FrontendLibraryCheck.objects.filter(**org_filter).filter(
             Q(vulnerability_status='vulnerable') | Q(vulnerability_status='outdated')
         ).count() +
-        SSLTLSCheck.objects.exclude(risk_rating='Low').count() +
-        EmailSecurityCheck.objects.filter(status='FAIL').count() +
-        SecurityHeaderCheck.objects.filter(status='missing').count() +
-        DNSSecurityCheck.objects.exclude(risk_rating='Low').count()
+        SSLTLSCheck.objects.filter(**org_filter).exclude(risk_rating='Low').count() +
+        EmailSecurityCheck.objects.filter(**org_filter, status='FAIL').count() +
+        SecurityHeaderCheck.objects.filter(**org_filter, status='missing').count() +
+        DNSSecurityCheck.objects.filter(**org_filter).exclude(risk_rating='Low').count()
     )
 
     check_score = 100
@@ -4619,19 +4737,20 @@ def executive_dashboard(request):
     overall_security_score = max(0, check_score - min(20, vuln_penalty))
     
     # Key Metrics
-    total_scans = Scan.objects.count()
-    completed_scans = Scan.objects.filter(status='completed').count()
-    failed_scans = Scan.objects.filter(status='failed').count()
+    total_scans = Scan.objects.filter(**org_filter).count()
+    completed_scans = Scan.objects.filter(**org_filter, status='completed').count()
+    failed_scans = Scan.objects.filter(**org_filter, status='failed').count()
     scans_this_week = Scan.objects.filter(
+        **org_filter,
         created_at__gte=timezone.now() - timedelta(days=7)
     ).count()
-    
+
     # Asset Overview
-    total_domains = Domain.objects.count()
-    total_assets = Asset.objects.count()
-    
+    total_domains = Domain.objects.filter(**org_filter).count()
+    total_assets = Asset.objects.filter(**org_filter).count()
+
     # Scan Status Summary
-    pending_scans = Scan.objects.filter(status__in=['queued', 'running']).count()
+    pending_scans = Scan.objects.filter(**org_filter, status__in=['queued', 'running']).count()
     
     # ============================================
     # TIER 2 - CRITICAL INSIGHTS
@@ -4639,7 +4758,7 @@ def executive_dashboard(request):
     
     # Worst Performing Owners (Top 5)
     worst_owners = []
-    domains_with_owner = Domain.objects.exclude(owner__isnull=True).exclude(owner='')
+    domains_with_owner = Domain.objects.filter(**org_filter).exclude(owner__isnull=True).exclude(owner='')
     
     for domain in domains_with_owner:
         # Get all assets for this domain
@@ -4696,7 +4815,7 @@ def executive_dashboard(request):
     
     # Worst Performing Assets (Top 10)
     worst_assets = []
-    for asset in Asset.objects.all():
+    for asset in Asset.objects.filter(**org_filter):
         finding_count = Finding.objects.filter(asset=asset).count()
         critical_count = Finding.objects.filter(asset=asset, risk_rating='Critical').count()
         high_count = Finding.objects.filter(asset=asset, risk_rating='High').count()
@@ -4726,7 +4845,7 @@ def executive_dashboard(request):
     
     # Most Common Vulnerabilities (Top 10)
     vulnerability_counts = Finding.objects.filter(
-        category='CVE'
+        **org_filter, category='CVE'
     ).values('title', 'risk_rating').annotate(
         frequency=Count('id')
     ).order_by('-frequency')[:10]
@@ -4745,7 +4864,7 @@ def executive_dashboard(request):
     # ============================================
     
     # Most Vulnerable Libraries (Top 5)
-    library_stats = FrontendLibraryCheck.objects.values('library_name').annotate(
+    library_stats = FrontendLibraryCheck.objects.filter(**org_filter).values('library_name').annotate(
         outdated_count=Count('id', filter=Q(vulnerability_status='outdated')),
         vulnerable_count=Count('id', filter=Q(vulnerability_status='vulnerable')),
         total_count=Count('id')
@@ -4765,7 +4884,7 @@ def executive_dashboard(request):
     
     # Most Commonly Missing Headers (Top 5)
     header_stats = SecurityHeaderCheck.objects.filter(
-        status='missing'
+        **org_filter, status='missing'
     ).values('header').annotate(
         frequency=Count('id'),
         affected_assets=Count('asset', distinct=True)
@@ -4844,11 +4963,11 @@ def executive_dashboard(request):
         'critical': 0      # 0-20
     }
     
-    for domain in Domain.objects.all():
+    for domain in Domain.objects.filter(**org_filter):
         asset_ids = domain.assets.values_list('id', flat=True)
         if not asset_ids:
             continue
-        
+
         domain_total_checks = (
             FrontendLibraryCheck.objects.filter(asset_id__in=asset_ids).count() +
             SSLTLSCheck.objects.filter(asset_id__in=asset_ids).count() +

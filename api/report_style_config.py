@@ -1,10 +1,32 @@
 """Central style and copy configuration for PDF and DOCX report generation."""
 
+from datetime import datetime, timezone
 from io import BytesIO
 import logging
 import re
 
+from .cve_checker import version_compare, fetch_eol_status, _EOL_PRODUCT_MAP
+
 logger = logging.getLogger(__name__)
+
+
+def _format_generated_at(value):
+    """Render the report timestamp in plain language, e.g. '22 June 2026 at 13:36 UTC'.
+
+    Accepts a datetime or an ISO string; falls back to the original value if it
+    cannot be parsed so the header is never left blank.
+    """
+    dt = value
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    try:
+        # %d keeps a leading zero on single-digit days; strip it for natural reading.
+        return dt.strftime('%d %B %Y at %H:%M UTC').lstrip('0')
+    except (AttributeError, ValueError):
+        return str(value)
 
 REPORT_TEXT = {
     'title': 'CERRT Vulnerability Remediation Report',
@@ -201,7 +223,7 @@ _TITLE_REMEDIATION = [
     ('dkim', 'Publish a DKIM public key in DNS and configure your MTA to sign all outgoing messages with at least 2048-bit keys. Rotate DKIM keys annually and monitor DMARC aggregate reports for failures.'),
     ('dmarc', 'Publish a DMARC record starting with p=none to monitor. Analyse aggregate reports (rua), fix SPF/DKIM alignment issues, then progress to p=quarantine and finally p=reject.'),
     ('spf', 'Publish an SPF TXT record listing all authorised mail servers. End with -all (hard fail) to reject mail from unlisted senders. Validate and update whenever mail infrastructure changes.'),
-    ('php', 'Upgrade PHP to a current supported release (8.2 or 8.3). PHP 7.x reached end-of-life and no longer receives security patches. Test in staging before deploying.'),
+    ('php', 'Upgrade PHP to the latest supported release published at php.net/supported-versions. End-of-life PHP versions no longer receive security patches and must be moved onto the current stable branch. Test in staging before deploying to production.'),
     ('wordpress', 'Keep WordPress core, active themes, and every plugin updated. Remove inactive plugins and themes. Restrict wp-admin by IP if possible, disable XML-RPC if not required, and deploy a WordPress WAF rule set.'),
     ('nginx', 'Update nginx to the latest stable release. Set server_tokens off to suppress version disclosure. Review nginx security advisories for the installed version and disable unused modules.'),
     ('clickjacking', 'Add X-Frame-Options: DENY and Content-Security-Policy: frame-ancestors \'none\' to all HTTP responses. These prevent the page from being loaded inside a third-party iframe.'),
@@ -306,7 +328,307 @@ def _get_groq_enhancement(finding):
         return None
 
 
-def _smart_remediation(finding):
+_UNKNOWN_VERSIONS = {'', 'unknown', 'n/a', 'none', 'latest', '-'}
+
+
+def _normalize_lib_key(name):
+    return re.sub(r'[^a-z0-9.+-]', '', (name or '').strip().lower())
+
+
+def _build_version_index(payload):
+    """Map normalized component name -> {display, detected, latest}.
+
+    Uses the *real* latest versions already fetched from the package registries
+    (npm/PyPI/Packagist/WordPress) at scan time and stored on the library and
+    technology checks. This is the trustworthy source for "what is the latest
+    version" — never a hardcoded string or an LLM guess.
+    """
+    index = {}
+    checks = (payload or {}).get('checks', {}) or {}
+    for item in checks.get('libraries', []) or []:
+        key = _normalize_lib_key(item.get('name'))
+        if key:
+            index[key] = {
+                'display': (item.get('name') or '').strip(),
+                'detected': (item.get('detected_version') or '').strip(),
+                'latest': (item.get('latest_version') or '').strip(),
+            }
+    for item in checks.get('technologies', []) or []:
+        key = _normalize_lib_key(item.get('name'))
+        if key and key not in index:
+            index[key] = {
+                'display': (item.get('name') or '').strip(),
+                'detected': (item.get('version') or '').strip(),
+                'latest': (item.get('latest_version') or '').strip(),
+            }
+    return index
+
+
+def _match_component_version(title, version_index):
+    """Find the component whose name appears in the finding title (longest match wins)."""
+    if not version_index:
+        return None
+    tl = (title or '').lower()
+    best = None
+    for info in version_index.values():
+        disp = (info.get('display') or '').lower()
+        if disp and disp in tl and (best is None or len(disp) > len(best[0])):
+            best = (disp, info)
+    return best[1] if best else None
+
+
+def _component_from_title(title):
+    """Best-effort component info parsed from a finding title like 'PHP 8.4.22'.
+
+    Lets runtimes/servers/frameworks covered by the authoritative endoflife.date
+    lookup (``_EOL_PRODUCT_MAP``) be verified against that live source even when
+    they are not present in the scan's component inventory — instead of falling
+    back to a static, possibly-stale claim about their support status.
+    """
+    if not title:
+        return None
+    tl = title.lower()
+    # Longest product name first so 'node.js' wins over 'node'.
+    for prod in sorted(_EOL_PRODUCT_MAP, key=len, reverse=True):
+        m = re.search(
+            r'(?<![a-z0-9])' + re.escape(prod) + r'[\s/v:_-]*([0-9]+(?:\.[0-9]+)*)',
+            tl,
+        )
+        if not m:
+            continue
+        display = title[m.start():m.start() + len(prod)]
+        return {'display': display, 'detected': m.group(1), 'latest': ''}
+    return None
+
+
+def _dynamic_component_remediation(info):
+    """Build remediation text from the real detected/latest versions — no hardcoding."""
+    display = info.get('display') or 'the component'
+    detected = (info.get('detected') or '').strip()
+    latest = (info.get('latest') or '').strip()
+    has_detected = detected.lower() not in _UNKNOWN_VERSIONS
+    has_latest = latest.lower() not in _UNKNOWN_VERSIONS
+
+    if has_detected and has_latest:
+        try:
+            cmp = version_compare(detected, latest)
+        except Exception:
+            cmp = None
+        if cmp is not None and cmp >= 0:
+            # Installed version is current (or ahead) — the "vulnerable" flag is
+            # almost certainly a signature/false-positive, so say so plainly.
+            return (
+                f"{display} {detected} is already the latest version published on its package "
+                f"registry ({latest}), so this is most likely a false positive from "
+                f"signature-based detection. Verify against the official {display} security "
+                f"advisories; no upgrade is required while the installed version is current."
+            )
+        return (
+            f"Update {display} from {detected} to {latest} — the current release published on "
+            f"its official package registry. If loaded via a CDN, update the URL, pin the new "
+            f"version, and add a Subresource Integrity (SRI) hash, then re-test the affected "
+            f"components after upgrading."
+        )
+    if has_detected:
+        return (
+            f"{display} {detected} is in use. Check the latest release on its official package "
+            f"registry (npm/PyPI/vendor) and upgrade if a newer version exists. If loaded via a "
+            f"CDN, pin the version and add a Subresource Integrity (SRI) hash, then re-test."
+        )
+    return (
+        f"Update {display} to the latest stable release published on its official package "
+        f"registry. If loaded via a CDN, pin the version and add a Subresource Integrity (SRI) "
+        f"hash, then re-test after upgrading."
+    )
+
+
+def _support_window_phrase(eol):
+    """Describe a component's support window from an endoflife.date record.
+
+    endoflife.date exposes two distinct fields that are easy to conflate:
+      * ``support`` — end of *active* support (bug fixes / full support).
+      * ``eol``     — end of *security* support (only security patches are issued
+                      between the active-support end and this date).
+
+    Crucially the schema is not uniform across products: each field may be an ISO
+    date string, a boolean (``true`` = still supported / no announced end, ``false``
+    = already ended), or absent entirely. This handles every shape so a runtime,
+    framework, or JS library all get a correct, non-contradictory phrase rather than
+    a bug-fix date mislabelled as "security support". Returns '' when nothing usable
+    is present.
+    """
+    if not isinstance(eol, dict):
+        return ''
+    sec_until = eol.get('eol')          # security-support end
+    active = eol.get('support')         # active / bug-fix support end
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    parts = []
+    # Security support (the is_eol==True case is handled by the caller, so here a
+    # date means "still patched until then").
+    if isinstance(sec_until, str):
+        parts.append(f"security support until {sec_until}")
+    elif sec_until is False:
+        parts.append("no announced security end-of-life date")
+
+    # Active / bug-fix support — may be a date or a boolean.
+    if isinstance(active, str):
+        if active < today:
+            parts.append(f"active bug-fix support ended {active}")
+        else:
+            parts.append(f"active bug-fix support until {active}")
+    elif active is True:
+        parts.append("still in active bug-fix support")
+    elif active is False:
+        parts.append("in the security-fix-only phase (active bug-fix support has ended)")
+
+    return '; '.join(parts)
+
+
+def _component_intel(info, flagged_vulnerable=False):
+    """Return (summary, remediation) for a component, grounded on real data.
+
+    Uses the registry-fetched latest version AND a live endoflife.date lookup so
+    end-of-life / supported claims are verified facts, never hardcoded guesses.
+    Falls back to neutral version-only wording if the online lookup is unavailable.
+
+    ``flagged_vulnerable`` is True when the scan's own vulnerability databases
+    (CVE / Retire.js) flagged this exact version. Support-window status must never
+    override that verdict — a version can be fully supported and still carry a known
+    CVE — so when it is set we keep the language consistent with a real vulnerability
+    rather than calling it "informational" or "not urgent".
+    """
+    display = info.get('display') or 'the component'
+    detected = (info.get('detected') or '').strip()
+    latest = (info.get('latest') or '').strip()
+    has_detected = detected.lower() not in _UNKNOWN_VERSIONS
+    has_latest = latest.lower() not in _UNKNOWN_VERSIONS
+
+    eol = None
+    if has_detected:
+        try:
+            eol = fetch_eol_status(display, detected)
+        except Exception:
+            eol = None
+
+    # Prefer the package-registry 'latest'; fall back to the EOL feed's latest.
+    if not has_latest and eol and eol.get('latest'):
+        latest = str(eol['latest']).strip()
+        has_latest = latest.lower() not in _UNKNOWN_VERSIONS
+
+    newer_available = False
+    if has_latest and has_detected:
+        try:
+            newer_available = version_compare(detected, latest) < 0
+        except Exception:
+            newer_available = False
+
+    summary = None
+    remediation = None
+
+    if eol is not None and eol.get('is_eol') is True:
+        since = f" (end-of-life since {eol['eol']})" if isinstance(eol.get('eol'), str) else " (end-of-life)"
+        latest_note = f" The latest release is {latest}." if has_latest else ""
+        summary = (
+            f"{display} {detected}{since} no longer receives security patches, leaving the "
+            f"application exposed to unpatched vulnerabilities.{latest_note}"
+        )
+        target = f" to {latest}" if has_latest else " to a currently supported release"
+        remediation = (
+            f"{display} {detected} is end-of-life — upgrade{target} and test in staging before "
+            f"deploying to production."
+        )
+    elif flagged_vulnerable:
+        # The scan's CVE / Retire.js matching flagged this version as vulnerable.
+        # Report it as such regardless of support-window status, but still surface
+        # the (factual) support context so the reader has the full picture.
+        support_note = ''
+        if eol is not None and eol.get('is_eol') is False:
+            phrase = _support_window_phrase(eol)
+            window = f" ({phrase})" if phrase else ""
+            support_note = (
+                f" The {detected} release line is still supported{window}, but that does "
+                f"not clear the reported vulnerability."
+            )
+        latest_note = f" The latest release is {latest}." if has_latest else ""
+        summary = (
+            f"{display} {detected} was flagged with a known vulnerability by the scan's "
+            f"vulnerability databases (CVE / Retire.js).{support_note}{latest_note}"
+        )
+        target = f" to {latest}" if (has_latest and newer_available) else " to a patched release"
+        remediation = (
+            f"Upgrade {display} from {detected}{target} to remediate the reported "
+            f"vulnerability. Review the {display} security advisories for the affected "
+            f"version; if loaded via a CDN, pin the new version and add a Subresource "
+            f"Integrity (SRI) hash, then re-test the affected components."
+        )
+    elif eol is not None and eol.get('is_eol') is False:
+        phrase = _support_window_phrase(eol)
+        until_txt = f" ({phrase})" if phrase else ""
+        # If active bug-fix support has ended the version is in the security-only
+        # phase — say "security-supported" rather than implying full support.
+        active = eol.get('support')
+        today = datetime.now(timezone.utc).date().isoformat()
+        security_only = active is False or (isinstance(active, str) and active < today)
+        window_word = "security-support window" if security_only else "support window"
+
+        if newer_available:
+            summary = (
+                f"{display} {detected} is still within its {window_word}{until_txt} and "
+                f"receives security patches, but a newer release ({latest}) is available."
+            )
+            remediation = (
+                f"{display} {detected} is supported, so this is not an urgent security gap, but a "
+                f"newer release ({latest}) is available — upgrade to stay current and pick up "
+                f"non-security fixes. If loaded via a CDN, pin the new version and add a "
+                f"Subresource Integrity (SRI) hash, then re-test."
+            )
+        else:
+            summary = (
+                f"{display} {detected} is the current release and within its "
+                f"{window_word}{until_txt}, so it still receives security patches. This detection "
+                f"is informational — confirm against the vendor advisory before treating it as a "
+                f"vulnerability."
+            )
+            remediation = (
+                f"{display} {detected} is a currently supported release, so no upgrade is required. "
+                f"Keep it patched within its release line"
+                + (f" (latest {latest})." if has_latest else ".")
+            )
+    else:
+        # No EOL data and not flagged vulnerable — neutral, version-grounded wording.
+        remediation = _dynamic_component_remediation(
+            {'display': display, 'detected': detected, 'latest': latest}
+        )
+        if has_detected and has_latest and not newer_available:
+            summary = (
+                f"{display} {detected} is the latest version published on its package "
+                f"registry, so this detection is informational — no known vulnerability or "
+                f"end-of-life status was confirmed for it."
+            )
+        elif has_detected and newer_available:
+            summary = (
+                f"{display} {detected} is in use and a newer release ({latest}) is available. "
+                f"Automated matching did not confirm a known vulnerability for this version — "
+                f"verify against the vendor advisory and keep it on a regular update cadence."
+            )
+        elif has_detected:
+            summary = (
+                f"{display} {detected} is in use. Automated matching did not confirm a known "
+                f"vulnerability or end-of-life status for this version — verify against the "
+                f"vendor advisory and keep it updated."
+            )
+        else:
+            summary = (
+                f"{display} was detected on this asset. No version was identified and automated "
+                f"matching did not flag a known vulnerability — this is an informational "
+                f"inventory entry, not a confirmed weakness."
+            )
+
+    return summary, remediation
+
+
+def _smart_remediation(finding, version_index=None):
     """Return (recommendation_text, issue_summary, links) using rich template advice,
     optionally augmented by Groq AI when its output is substantively better.
 
@@ -314,7 +636,8 @@ def _smart_remediation(finding):
     only used when it is non-trivial (long, distinct from the raw recommendation,
     not URL-only) — otherwise the template wins.
     """
-    title = (finding.get('title') or '').lower()
+    raw_title = finding.get('title') or ''
+    title = raw_title.lower()
     category = (finding.get('category') or '').lower()
     risk = (finding.get('risk_rating') or 'Low').lower()
     raw = (finding.get('recommendation') or '').strip()
@@ -329,7 +652,28 @@ def _smart_remediation(finding):
     cleaned_raw = re.sub(r'https?://[^\s)]+', '', raw).strip() or None
 
     # --- Template-based summary + remediation (always computed) ---
-    if is_generic:
+    # For known libraries/technologies, prefer remediation built from the REAL
+    # registry-fetched versions over any hardcoded template or raw recommendation.
+    component = _match_component_version(raw_title, version_index)
+    if not component:
+        # Not in the inventory — but if the title names a runtime/server covered by
+        # the live endoflife.date lookup, verify it against that authoritative source
+        # rather than a static template.
+        component = _component_from_title(raw_title)
+    component_summary = None
+    if component:
+        # The scan's own vulnerability detection (CVE / Retire.js) is the source of
+        # truth for "is this version vulnerable" — an elevated rating or an explicit
+        # vulnerable/CVE signal must not be overridden by support-window status.
+        flagged_vulnerable = (
+            risk in ('critical', 'high', 'medium')
+            or 'vulnerable' in title
+            or 'retire' in title
+            or 'cve' in title
+            or category == 'cve'
+        )
+        component_summary, rec_text = _component_intel(component, flagged_vulnerable)
+    elif is_generic:
         specific = _keyword_lookup(title, _TITLE_REMEDIATION)
         if not specific:
             specific = _CATEGORY_REMEDIATION.get(category)
@@ -337,7 +681,7 @@ def _smart_remediation(finding):
     else:
         rec_text = cleaned_raw
 
-    summary = _keyword_lookup(title, _TITLE_SUMMARY)
+    summary = component_summary or _keyword_lookup(title, _TITLE_SUMMARY)
     if not summary:
         summary = _CATEGORY_SUMMARY.get(
             category,
@@ -346,8 +690,15 @@ def _smart_remediation(finding):
             'exploitability in the context of the target environment.',
         )
 
-    # --- Optional Groq augmentation ---
-    groq_result = _get_groq_enhancement(finding)
+    # --- Optional Groq augmentation (grounded on the real registry versions) ---
+    groq_finding = finding
+    if component:
+        groq_finding = {
+            **finding,
+            'detected_version': component.get('detected') or '',
+            'latest_version': component.get('latest') or '',
+        }
+    groq_result = _get_groq_enhancement(groq_finding)
     evidence_lower = (finding.get('evidence') or '').strip().lower()
     if groq_result:
         g_rem = (groq_result.get('remediation_steps') or '').strip()
@@ -365,9 +716,13 @@ def _smart_remediation(finding):
                 or any(p in t for p in _GENERIC_PHRASES)
             )
 
-        if g_rem_clean and not _is_stub(g_rem_clean):
+        # Keep our registry-grounded version remediation for known components;
+        # only let Groq replace the remediation when we have no component versions.
+        if g_rem_clean and not _is_stub(g_rem_clean) and not component:
             rec_text = g_rem_clean
-        if g_sum_clean and not _is_stub(g_sum_clean):
+        # Keep our verified EOL/support summary for components; let Groq fill the
+        # rest only when we don't have an authoritative component fact.
+        if g_sum_clean and not _is_stub(g_sum_clean) and not component_summary:
             summary = g_sum_clean
 
     suffix = _RISK_SUFFIX.get(risk, '')
@@ -409,31 +764,104 @@ def _root_domain(asset):
     return s
 
 
+_CVE_RE = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
+# A title that ends in a version number, e.g. "Swiper 8.4.5", "Chart.js 4.0.1",
+# "simple-download-monitor 8". The part before the version is the component name.
+_VERSION_TITLE_RE = re.compile(r'^(?P<name>.*\S)\s+v?\d+(?:\.\d+)*$')
+
+
+def _component_base_title(title):
+    """Return the clean ``Component X.Y.Z`` base for a component+version finding.
+
+    The scanner emits a separate finding per advisory, so the same component and
+    version appears many times with different titles — a generic ``(vulnerable)``
+    tag plus one row per CVE / Retire.js hit. Stripping the trailing advisory
+    suffix and parenthetical tag gives a single base that merges them all.
+
+    Returns None for non-component titles (headers, DNS, SSL, email, etc.) so they
+    keep their own identity and are never merged together.
+    """
+    if not title:
+        return None
+    # Drop a trailing advisory suffix such as " - CVE-2026-27212" or
+    # " - Retire.js Vulnerability:".
+    base = title.split(' - ', 1)[0].strip()
+    # Drop a trailing parenthetical tag such as "(vulnerable)" / "(outdated)".
+    base = re.sub(r'\s*\([^)]*\)\s*$', '', base).strip()
+    if _VERSION_TITLE_RE.match(base):
+        return base
+    return None
+
+
 def _aggregate_findings(findings):
-    """Collapse findings sharing the same (title, category, risk) into a single
-    entry whose 'assets' list contains every affected asset."""
+    """Collapse duplicate findings into a single entry whose 'assets' list contains
+    every affected asset and whose 'cve_ids' list contains every advisory.
+
+    Component+version findings (any ``Name X.Y.Z``) are merged across all of their
+    individual CVE / advisory rows into one card; everything else is merged only
+    when it shares the same (title, category, risk)."""
     bucket = {}
     order = []
     for f in findings:
-        key = (
-            (f.get('title') or 'Untitled finding').strip(),
-            (f.get('category') or 'Other').strip(),
-            (f.get('risk_rating') or 'Low').strip(),
-        )
+        title = (f.get('title') or 'Untitled finding').strip()
+        category = (f.get('category') or 'Other').strip()
+        risk = (f.get('risk_rating') or 'Low').strip()
+        base = _component_base_title(title)
+        if base:
+            # One card per component+version, regardless of which advisory each
+            # individual finding named.
+            key = ('component', base.lower())
+        else:
+            key = ('title', title, category, risk)
         if key not in bucket:
             agg = dict(f)
             agg['assets'] = []
             agg['cve_ids'] = list(f.get('cve_ids') or [])
+            agg['_base'] = base
+            agg['_vuln'] = False
+            agg['_outdated'] = False
             bucket[key] = agg
             order.append(key)
         agg = bucket[key]
+        # Keep the highest severity seen across the merged advisories.
+        if risk_order(risk) < risk_order(agg.get('risk_rating')):
+            agg['risk_rating'] = risk
+        # Track whether any merged member is an actual vulnerability / outdated tag,
+        # so a benign inventory entry (e.g. a current PHP) is never relabelled.
+        tl = title.lower()
+        if (risk_order(risk) <= risk_order('Medium')
+                or 'vulnerable' in tl or 'cve' in tl or 'retire' in tl
+                or (f.get('cve_ids') or [])):
+            agg['_vuln'] = True
+        if 'outdated' in tl:
+            agg['_outdated'] = True
         asset = (f.get('asset') or '').strip()
         if asset and asset not in agg['assets']:
             agg['assets'].append(asset)
-        for cve in (f.get('cve_ids') or []):
-            if cve not in agg['cve_ids']:
-                agg['cve_ids'].append(cve)
-    return [bucket[k] for k in order]
+        # Collect CVE IDs from the structured field and from the title text.
+        cves = list(f.get('cve_ids') or []) + _CVE_RE.findall(title)
+        for cve in cves:
+            cve_u = cve.upper()
+            if cve_u not in agg['cve_ids']:
+                agg['cve_ids'].append(cve_u)
+
+    # Finalise the display title for component-grouped cards: keep it clean, and
+    # only add a "(vulnerable)"/"(outdated)" tag when the group actually warrants it.
+    result = []
+    for k in order:
+        agg = bucket[k]
+        base = agg.pop('_base', None)
+        is_vuln = agg.pop('_vuln', False)
+        is_outdated = agg.pop('_outdated', False)
+        if base:
+            if is_vuln:
+                agg['title'] = f"{base} (vulnerable)"
+            elif is_outdated:
+                agg['title'] = f"{base} (outdated)"
+            else:
+                agg['title'] = base
+        result.append(agg)
+    return result
 
 
 def _affects_text(assets):
@@ -516,8 +944,10 @@ def _check_section_summary(section_name, grouped_items):
     if 'ssl' in name or 'tls' in name:
         if not issue_count:
             return [
-                f"<b>{total} SSL/TLS checks recorded.</b> No protocol or certificate "
-                "issues detected. Continue periodic re-testing with an SSL scanner.",
+                f"<b>{total} SSL/TLS check(s) recorded.</b> No high-severity protocol "
+                "or certificate problems were flagged automatically, but review the "
+                "items listed below and remediate any deprecated protocols, weak "
+                "ciphers, or untrusted/expired certificates. Re-test with an SSL scanner.",
             ]
         protocol = has('protocol', 'tls version', 'deprecated')
         certs = has('certificate', 'expired', 'mismatched', 'self-signed', 'ssl certificate issuer')
@@ -614,8 +1044,10 @@ def _check_section_summary(section_name, grouped_items):
     if 'dns' in name:
         if not issue_count:
             return [
-                f"<b>{total} DNS checks recorded.</b> No DNS misconfigurations or "
-                "subdomain-takeover candidates detected. Continue periodic auditing.",
+                f"<b>{total} DNS check(s) recorded.</b> No high-severity DNS issues "
+                "were flagged automatically, but review the entries below — including "
+                "any subdomain-takeover candidates, missing CAA records, or stale "
+                "TXT/CNAME records — and confirm each is expected.",
             ]
         takeover = has('subdomain_takeover', 'takeover')
         caa = has('caa')
@@ -672,8 +1104,10 @@ def _check_section_summary(section_name, grouped_items):
         outdated = [g for g in grouped_items if 'outdated' in (g.get('status') or '').lower()]
         if not (vuln or outdated):
             return [
-                f"<b>{total} components inventoried.</b> No vulnerable or outdated "
-                "versions detected at scan time. Maintain dependency-update cadence.",
+                f"<b>{total} component(s) inventoried.</b> None were flagged vulnerable "
+                "or outdated by automated version matching, but detection is best-effort "
+                "— verify any end-of-life runtimes or frameworks against their official "
+                "supported-version lists and keep dependencies on a regular update cadence.",
             ]
         return [
             f"<b>{len(vuln)} vulnerable</b> and <b>{len(outdated)} outdated</b> "
@@ -833,7 +1267,7 @@ def generate_pdf_report(payload):
     status_color = C['status_completed']
     story.append(
         Paragraph(
-            f"Generated {payload['generated_at']}  \u00b7  Scan #{summary['scan_id']}  \u00b7  "
+            f"Generated {_format_generated_at(payload['generated_at'])}  \u00b7  Scan #{summary['scan_id']}  \u00b7  "
             f"{summary['scan_type']}  \u00b7  "
             f"<font color='{status_color}'>{summary['status']}</font>  \u00b7  "
             f"{summary['total_assets_scanned']} asset checked",
@@ -983,6 +1417,7 @@ def generate_pdf_report(payload):
             textColor=colors.HexColor(C['text_muted']),
         )
 
+        version_index = _build_version_index(payload)
         running_index = 0
         for domain, dom_findings in domain_groups:
             # Domain header bar
@@ -1010,7 +1445,7 @@ def generate_pdf_report(payload):
                 index = running_index
                 risk = finding.get('risk_rating') or 'Low'
                 sev = C['severity'].get(risk, C['severity']['default'])
-                remediation_text, issue_summary, remediation_links = _smart_remediation(finding)
+                remediation_text, issue_summary, remediation_links = _smart_remediation(finding, version_index)
 
                 badge = Paragraph(
                     f"<font color='{sev['text']}'><b>{risk}</b></font>",
@@ -1033,10 +1468,22 @@ def generate_pdf_report(payload):
                 affects_cell = Paragraph(affects, affects_style)
 
                 # ABOUT sub-table (left column)
-                about_body = Paragraph(
-                    issue_summary or finding.get('evidence') or 'Finding details not available.',
-                    muted_body_style,
+                about_text = (
+                    issue_summary or finding.get('evidence')
+                    or 'Finding details not available.'
                 )
+                # List every advisory merged into this component+version card so
+                # no CVE/Retire.js detail is lost when the rows are collapsed.
+                cve_ids = finding.get('cve_ids') or []
+                if cve_ids:
+                    shown = ', '.join(cve_ids[:10])
+                    if len(cve_ids) > 10:
+                        shown += f", +{len(cve_ids) - 10} more"
+                    about_text = (
+                        f"{about_text}<br/><br/>"
+                        f"<b>Associated advisories:</b> {shown}"
+                    )
+                about_body = Paragraph(about_text, muted_body_style)
                 about_sub = Table(
                     [[Paragraph('ABOUT THIS ISSUE', about_label_style)], [about_body]],
                     colWidths=[70 * mm],
@@ -1175,20 +1622,13 @@ def generate_pdf_report(payload):
             ]]
             for f in rest_findings:
                 title = f.get('title') or 'Untitled finding'
-                _rem, finding_summary, _links = _smart_remediation(f)
+                _rem, finding_summary, _links = _smart_remediation(f, version_index)
                 summary_text = (finding_summary or '').strip()
-                # Trim to first sentence to keep table compact
-                if summary_text:
-                    first_sentence = summary_text.split('. ', 1)[0].rstrip('.') + '.'
-                    if len(first_sentence) > 180:
-                        first_sentence = first_sentence[:177] + '…'
-                else:
-                    first_sentence = ''
                 finding_html = f"<b>{title}</b>"
-                if first_sentence:
+                if summary_text:
                     finding_html += (
                         f"<br/><font size='7' color='{C['text_muted']}'>"
-                        f"{first_sentence}</font>"
+                        f"{summary_text}</font>"
                     )
                 assets_list = f.get('assets') or []
                 if len(assets_list) > 3:

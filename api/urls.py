@@ -1,6 +1,9 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
+from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
+from . import auth_views
+from . import admin_views
 from .report_summary_views import ReportSummaryExportView
 from .detailed_report_api import DetailedReportExportView
 
@@ -12,6 +15,28 @@ router.register(r'assets', views.AssetViewSet, basename='asset')      # ADD THIS
 router.register(r'scans', views.ScanViewSet, basename='scan')
 
 urlpatterns = [
+     # ── Authentication (JWT) ──
+     path('auth/login/', auth_views.LoginView.as_view(), name='auth-login'),
+     path('auth/refresh/', TokenRefreshView.as_view(), name='auth-refresh'),
+     path('auth/logout/', auth_views.LogoutView.as_view(), name='auth-logout'),
+     path('auth/me/', auth_views.MeView.as_view(), name='auth-me'),
+     path('auth/invitations/accept/', auth_views.AcceptInvitationView.as_view(), name='auth-accept-invite'),
+
+     # ── Organisation & member management ──
+     path('org/', auth_views.OrganisationDetailView.as_view(), name='org-detail'),
+     path('org/members/', auth_views.MemberListView.as_view(), name='org-members'),
+     path('org/members/<int:pk>/', auth_views.MemberDetailView.as_view(), name='org-member-detail'),
+     path('org/invitations/', auth_views.InvitationListCreateView.as_view(), name='org-invitations'),
+     path('org/invitations/<int:pk>/resend/', auth_views.InvitationResendView.as_view(), name='org-invitation-resend'),
+
+     # ── Platform admin (super-admin, cross-org) ──
+     path('admin/organisations/', admin_views.AdminOrganisationListCreateView.as_view(), name='admin-org-list'),
+     path('admin/organisations/<int:pk>/', admin_views.AdminOrganisationDetailView.as_view(), name='admin-org-detail'),
+     path('admin/organisations/<int:pk>/owner/', admin_views.AdminOrganisationOwnerView.as_view(), name='admin-org-owner'),
+     path('admin/users/', admin_views.AdminUserListView.as_view(), name='admin-users'),
+     path('admin/dashboard/', admin_views.AdminDashboardView.as_view(), name='admin-dashboard'),
+     path('admin/activity/', admin_views.AdminActivityView.as_view(), name='admin-activity'),
+
      # Report summary export endpoint (domain/asset scoped)
      path('report/summary/export/', ReportSummaryExportView.as_view(), name='report-summary-export'),
      path('report/summary/export/<int:scan_id>/', ReportSummaryExportView.as_view(), name='report-summary-export-scan'),

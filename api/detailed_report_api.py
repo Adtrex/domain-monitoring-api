@@ -1,9 +1,10 @@
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from .models import Scan
+from .permissions import get_user_organisation
 from .detailed_report import generate_detailed_report_docx
 
 
@@ -15,10 +16,11 @@ from .report_summary_views import _normalize_severity
 from .report_external_links import get_external_reference
 
 class DetailedReportExportView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, scan_id=None):
-        scan_obj = get_object_or_404(Scan, id=scan_id)
+        org = get_user_organisation(request)
+        scan_obj = get_object_or_404(Scan, id=scan_id, organisation=org)
         domain_obj = None
         assets = Asset.objects.filter(asset_scans__scan=scan_obj).distinct()
         if assets.exists():

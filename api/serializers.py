@@ -33,12 +33,16 @@ class DomainSerializer(serializers.ModelSerializer):
     class Meta:
         model = Domain
         fields = '__all__'
+        # organisation is assigned server-side from the caller's token, never by the client.
+        read_only_fields = ['organisation']
 
 
 class AssetSerializer(serializers.ModelSerializer):
     class Meta:
         model = Asset
         fields = '__all__'
+        # organisation is assigned server-side from the caller's token, never by the client.
+        read_only_fields = ['organisation']
 
 
 # ============================================
