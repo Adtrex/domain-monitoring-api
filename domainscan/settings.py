@@ -247,8 +247,15 @@ REST_FRAMEWORK = {
 }
 
 # A scan stuck in running/queued longer than this is treated as orphaned
-# (server restart killed its synchronous worker) and auto-finalized.
+# (server restart killed its worker) and auto-finalized.
 SCAN_STALE_TIMEOUT_MINUTES = int(os.getenv('SCAN_STALE_TIMEOUT_MINUTES', '120'))
+
+# Scans run on a bounded background worker pool instead of the web request, so a
+# slow scan never blocks the API. This caps how many scans run concurrently per
+# server process; raise it on a box with spare CPU/network, lower it to protect
+# a small instance. (See api.views.submit_scan_job — swap to Celery to scale
+# scan execution across multiple hosts.)
+SCAN_WORKER_THREADS = int(os.getenv('SCAN_WORKER_THREADS', '2'))
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(
