@@ -49,15 +49,25 @@ def get_user_organisation(request):
     user = getattr(request, 'user', None)
     if is_platform_admin(user):
         org_id = requested_org_id(request)
-        if not org_id:
-            raise PermissionDenied(
-                'Platform admin: specify organisation_id (query param or X-Organisation-Id '
-                'header) to act within a specific organisation, or use the /api/admin/ endpoints.'
-            )
-        try:
-            return Organisation.objects.get(id=org_id)
-        except (Organisation.DoesNotExist, ValueError, TypeError):
-            raise PermissionDenied(f'Organisation {org_id} not found.')
+        if org_id:
+            try:
+                return Organisation.objects.get(id=org_id)
+            except (Organisation.DoesNotExist, ValueError, TypeError):
+                raise PermissionDenied(f'Organisation {org_id} not found.')
+
+        # No explicit target. A platform admin who is also a member of an org
+        # (e.g. an owner running scans in their own org via the normal UI) acts
+        # within that org by default, so they don't have to send organisation_id
+        # on every request. Only require an explicit target when they belong to
+        # no org at all.
+        membership = get_user_membership(user)
+        if membership is not None:
+            return membership.organisation
+
+        raise PermissionDenied(
+            'Platform admin: specify organisation_id (query param or X-Organisation-Id '
+            'header) to act within a specific organisation, or use the /api/admin/ endpoints.'
+        )
 
     membership = get_user_membership(user)
     if membership is None:

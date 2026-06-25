@@ -7,9 +7,12 @@ from rest_framework.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
 from django.db.models import Count, Q
-from django.db import IntegrityError
+from django.db import IntegrityError, connection
+from django.conf import settings
 from django.utils import timezone
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+import os
 import csv
 import json
 import logging
@@ -906,15 +909,33 @@ class AssetViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
 
         return queryset
 
+    def perform_create(self, serializer):
+        # Stamp the asset with its domain's organisation. For platform admins
+        # the domain may belong to any org (they are unrestricted); for regular
+        # users the create() guard already confirmed the domain is in their org.
+        domain = serializer.validated_data.get('domain')
+        if domain is not None and is_platform_admin(getattr(self.request, 'user', None)):
+            serializer.save(organisation=domain.organisation)
+        else:
+            serializer.save(organisation=self.get_organisation())
+
     def create(self, request, *args, **kwargs):
         """Create an asset, but reuse an existing one if it already exists for the domain."""
-        org = self.get_organisation()
         domain_id = request.data.get('domain')
         raw_value = request.data.get('value', '')
 
-        # The target domain must belong to the caller's organisation.
-        if domain_id:
-            if not Domain.objects.filter(id=domain_id, organisation=org).exists():
+        # Resolve the organisation the asset belongs to. Platform admins are
+        # unrestricted: they can create assets under any organisation's domain,
+        # and the asset is stamped with that domain's org. Regular users are
+        # scoped to their own organisation.
+        if is_platform_admin(getattr(request, 'user', None)):
+            domain = Domain.objects.filter(id=domain_id).first() if domain_id else None
+            if domain_id and domain is None:
+                raise ValidationError({'domain': 'Domain not found.'})
+            org = domain.organisation if domain else self.get_organisation()
+        else:
+            org = self.get_organisation()
+            if domain_id and not Domain.objects.filter(id=domain_id, organisation=org).exists():
                 raise ValidationError({'domain': 'Domain not found in your organisation.'})
 
         if domain_id and raw_value:
@@ -948,6 +969,66 @@ class AssetViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
                     serializer = self.get_serializer(existing)
                     return Response(serializer.data, status=status.HTTP_200_OK)
             raise
+
+
+# ============================================
+# BACKGROUND SCAN EXECUTION
+# ============================================
+#
+# A scan runs the Nuclei binary plus header/DNS/email/library checks across
+# every asset and takes minutes. Running it inside the HTTP request held a web
+# worker the whole time, so a handful of concurrent scans could starve the API.
+# We hand execution to a bounded background worker pool instead: the endpoint
+# enqueues the job and returns immediately, and the client polls scan status.
+#
+# `submit_scan_job` is the single seam between "API request" and "scan runs".
+# To scale beyond one host, swap its body to enqueue a Celery task (the worker
+# would just call `ScanViewSet()._run_scan_job(scan, params)` the same way).
+
+_SCAN_WORKER_THREADS = getattr(settings, 'SCAN_WORKER_THREADS', None) or int(
+    os.getenv('SCAN_WORKER_THREADS', '2')
+)
+_scan_pool = ThreadPoolExecutor(
+    max_workers=_SCAN_WORKER_THREADS, thread_name_prefix='scan-worker'
+)
+
+
+def _scan_job_worker(scan_id, params):
+    """Run one scan in a background thread, with its own DB connection.
+
+    The pipeline persists all state on the Scan row, so the worker only needs to
+    reload the scan, run it, and make sure a crash still finalises the row
+    instead of leaving it stuck in 'running'.
+    """
+    try:
+        scan = Scan.objects.get(id=scan_id)
+        ScanViewSet()._run_scan_job(scan, params)
+    except Exception:
+        logger.exception("Background scan job %s crashed", scan_id)
+        try:
+            scan = Scan.objects.get(id=scan_id)
+            if scan.status in ('queued', 'running'):
+                scan.status = 'failed'
+                scan.error_message = 'Scan worker crashed before completion.'
+                scan.finished_at = timezone.now()
+                if scan.started_at:
+                    scan.duration_seconds = int(
+                        (scan.finished_at - scan.started_at).total_seconds()
+                    )
+                scan.save(update_fields=[
+                    'status', 'error_message', 'finished_at', 'duration_seconds'
+                ])
+        except Exception:
+            logger.exception("Failed to finalise crashed scan %s", scan_id)
+    finally:
+        # Django opens a per-thread connection on first query; close it so the
+        # pool's long-lived threads don't hold connections open indefinitely.
+        connection.close()
+
+
+def submit_scan_job(scan_id, params):
+    """Enqueue a queued scan for background execution and return immediately."""
+    _scan_pool.submit(_scan_job_worker, scan_id, params)
 
 
 # ============================================
@@ -1019,15 +1100,35 @@ class ScanViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
         scan_type = serializer.validated_data.get('scan_type', 'on-demand')
         template_categories = serializer.validated_data.get('template_categories', [])
 
-        org = self.get_organisation()
-
-        # Validate assets exist within the caller's organisation
-        assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
-        if assets.count() != len(set(asset_ids)):
-            return Response(
-                {'error': 'One or more asset IDs not found in your organisation'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Resolve assets and the scan's organisation. Platform admins are
+        # unrestricted: they can scan any organisation's assets across one or
+        # more domains. The scan is stamped with the org that owns those assets.
+        # A single scan record holds one org (Scan.organisation is required), so
+        # a cross-org batch is rejected with a clear message rather than silently
+        # dropping targets. Regular users are scoped to their own organisation.
+        if is_platform_admin(getattr(request, 'user', None)):
+            assets = Asset.objects.filter(id__in=asset_ids)
+            if assets.count() != len(set(asset_ids)):
+                return Response(
+                    {'error': 'One or more asset IDs not found'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            org_ids = set(assets.values_list('organisation_id', flat=True))
+            if len(org_ids) > 1:
+                return Response(
+                    {'error': 'A single scan cannot span multiple organisations. '
+                              'Submit one scan per organisation.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            org = assets.first().organisation
+        else:
+            org = self.get_organisation()
+            assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
+            if assets.count() != len(set(asset_ids)):
+                return Response(
+                    {'error': 'One or more asset IDs not found in your organisation'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         # Create scan
         scan = Scan.objects.create(
@@ -1476,8 +1577,35 @@ class ScanViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get scan parameters
-        templates = request.data.get('templates', ['ssl', 'dns', 'email'])
+        # Hand the heavy pipeline to a background worker so this request returns
+        # immediately instead of holding a web worker for the minutes a full scan
+        # takes. The client polls GET /api/scans/{id}/ for status transitions
+        # (queued -> running -> completed/failed/cancelled).
+        params = {
+            'templates': request.data.get('templates', ['ssl', 'dns', 'email']),
+            'check_libraries': request.data.get('check_libraries', True),
+            'check_cves': request.data.get('check_cves', True),
+            'extract_org': request.data.get('extract_org', True),
+        }
+        submit_scan_job(scan.id, params)
+        return Response(
+            {
+                'message': 'Scan queued for execution.',
+                'scan_id': scan.id,
+                'status': scan.status,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    def _run_scan_job(self, scan, params):
+        """Execute the full scan pipeline for a queued scan.
+
+        Runs in a background worker (see submit_scan_job / _scan_job_worker),
+        never in the web request, so a slow scan never blocks the API. All state
+        is persisted on the Scan row; the return value is ignored by the worker.
+        """
+        # Expand requested template categories into concrete template paths.
+        templates = params.get('templates', ['ssl', 'dns', 'email'])
         expanded_templates = []
         for template in templates:
             mapped = get_template_path(template)
@@ -1488,10 +1616,10 @@ class ScanViewSet(OrganisationScopedMixin, viewsets.ModelViewSet):
             else:
                 expanded_templates.append(mapped)
         templates = expanded_templates
-        check_libraries = request.data.get('check_libraries', True)
-        check_cves = request.data.get('check_cves', True)
-        extract_org = request.data.get('extract_org', True)
-        
+        check_libraries = params.get('check_libraries', True)
+        check_cves = params.get('check_cves', True)
+        extract_org = params.get('extract_org', True)
+
         # Get assets
         scan_assets = ScanAsset.objects.filter(scan=scan).select_related('asset')
         assets = [sa.asset for sa in scan_assets]
@@ -3245,14 +3373,27 @@ def execute_nuclei_scan(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # Get assets (scoped to the caller's organisation)
-    org = get_user_organisation(request)
-    assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
+    # Get assets. Platform admins can quick-scan any organisation's assets, so
+    # they are not bound to a single org — the scan is stamped with the org that
+    # owns the targeted assets. An admin may still narrow to one org via
+    # organisation_id (query param or X-Organisation-Id header). Regular users
+    # are scoped to their own organisation.
+    if is_platform_admin(getattr(request, 'user', None)):
+        assets = Asset.objects.filter(id__in=asset_ids)
+        requested = requested_org_id(request)
+        if requested:
+            assets = assets.filter(organisation_id=requested)
+    else:
+        org = get_user_organisation(request)
+        assets = Asset.objects.filter(id__in=asset_ids, organisation=org)
     if not assets.exists():
         return Response(
             {'error': f'No valid assets found for IDs: {asset_ids}'},
             status=status.HTTP_400_BAD_REQUEST
         )
+
+    # Scan record is stamped with the org that owns the scanned assets.
+    org = assets.first().organisation
 
     active_assets, inactive_assets = _split_active_assets(assets)
     if inactive_assets:
