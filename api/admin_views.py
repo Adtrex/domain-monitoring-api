@@ -193,7 +193,13 @@ class AdminDashboardView(APIView):
             for row in Finding.objects.values('risk_rating').annotate(count=Count('id'))
         }
         top_orgs = [
-            {'organisation': o.name, 'findings': o.findings.count(), 'scans': o.scans.count()}
+            {
+                'id': o.id,
+                'organisation': o.name,
+                'primary_domain': o.domains.count(),
+                'findings': o.findings.count(),
+                'scans': o.scans.count(),
+            }
             for o in Organisation.objects.all()
         ]
         top_orgs.sort(key=lambda x: x['findings'], reverse=True)
