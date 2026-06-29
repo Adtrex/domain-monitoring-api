@@ -209,6 +209,7 @@ class AdminDashboardView(APIView):
                 'completed': Scan.objects.filter(status='completed').count(),
                 'running': Scan.objects.filter(status='running').count(),
                 'failed': Scan.objects.filter(status='failed').count(),
+                'cancelled': Scan.objects.filter(status='cancelled').count(),
                 'last_7_days': Scan.objects.filter(created_at__gte=week_ago).count(),
             },
             'findings': {
