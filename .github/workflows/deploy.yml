@@ -1,0 +1,106 @@
+name: Test & Deploy
+
+# Manual trigger only: Actions tab -> "Test & Deploy" -> "Run workflow"
+on:
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests and deploy straight away"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: ${{ !inputs.skip_tests }}
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: domainscan_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SECRET_KEY: ci-only-not-secret
+      DEBUG: "False"
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: domainscan_test
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: localhost
+      DB_PORT: "5432"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Django checks
+        run: |
+          mkdir -p logs
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+
+      - name: Run tests
+        run: python manage.py test
+
+  deploy:
+    needs: test
+    # Run when tests passed, or when they were skipped on purpose
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_DIR: ${{ vars.APP_DIR }}
+          WEB_SERVICE: ${{ vars.WEB_SERVICE || 'web' }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          envs: APP_DIR,WEB_SERVICE
+          script_stop: true
+          script: |
+            set -e
+            cd "$APP_DIR"
+
+            echo "==> Pulling latest main"
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "==> Building and restarting containers"
+            docker compose up -d --build --remove-orphans
+
+            echo "==> Running migrations"
+            docker compose exec -T "$WEB_SERVICE" python manage.py migrate --noinput
+
+            echo "==> Cleaning up old images"
+            docker image prune -f
+
+            docker compose ps
