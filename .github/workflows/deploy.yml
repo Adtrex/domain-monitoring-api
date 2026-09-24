@@ -74,6 +74,20 @@ jobs:
     environment: production
 
     steps:
+      # The whole .env lives in one secret. Base64 keeps it on a single line so
+      # quotes, spaces and newlines survive the trip over SSH untouched.
+      - name: Encode .env
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          if [ -z "$ENV_FILE" ]; then
+            echo "::error::ENV_FILE secret is empty"
+            exit 1
+          fi
+          ENV_B64=$(printf '%s\n' "$ENV_FILE" | base64 -w0)
+          echo "::add-mask::$ENV_B64"
+          echo "ENV_B64=$ENV_B64" >> "$GITHUB_ENV"
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         env:
@@ -84,8 +98,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          envs: APP_DIR,WEB_SERVICE
-          script_stop: true
+          envs: APP_DIR,WEB_SERVICE,ENV_B64
           script: |
             set -e
             cd "$APP_DIR"
@@ -93,6 +106,10 @@ jobs:
             echo "==> Pulling latest main"
             git fetch origin main
             git reset --hard origin/main
+
+            echo "==> Writing .env from ENV_FILE secret"
+            echo "$ENV_B64" | base64 -d > .env
+            chmod 600 .env
 
             echo "==> Building and restarting containers"
             docker compose up -d --build --remove-orphans
